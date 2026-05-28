@@ -1,0 +1,10 @@
+pyqlib
+lightgbm
+ruamel.yaml
+jupyter
+notebook
+pandas
+numpy
+matplotlib
+seaborn
+akshare

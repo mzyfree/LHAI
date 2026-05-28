@@ -1,0 +1,76 @@
+qlib_init:
+  provider_uri: /Users/Dylan.Min/Documents/Code/learn/LHAI/paper_trading_system/data/current
+  region: cn
+market: csi1000
+benchmark: SH000852
+data_handler_config: &id001
+  start_time: '2011-01-01'
+  end_time: '2020-09-25'
+  fit_start_time: '2011-01-01'
+  fit_end_time: '2018-12-31'
+  instruments: csi1000
+port_analysis_config: &id002
+  strategy:
+    class: TopkDropoutStrategy
+    module_path: qlib.contrib.strategy
+    kwargs:
+      signal: <PRED>
+      topk: 50
+      n_drop: 5
+  backtest:
+    start_time: '2020-01-01'
+    end_time: '2020-09-25'
+    account: 100000000
+    benchmark: SH000852
+    exchange_kwargs:
+      limit_threshold: 0.095
+      deal_price: close
+      open_cost: 0.0005
+      close_cost: 0.0015
+      min_cost: 5
+      codes: csi1000
+task:
+  model:
+    class: XGBModel
+    module_path: qlib.contrib.model.xgboost
+    kwargs:
+      eval_metric: rmse
+      colsample_bytree: 0.8879
+      eta: 0.0421
+      max_depth: 8
+      n_estimators: 300
+      subsample: 0.8789
+      nthread: 8
+  dataset:
+    class: DatasetH
+    module_path: qlib.data.dataset
+    kwargs:
+      handler:
+        class: Alpha158
+        module_path: qlib.contrib.data.handler
+        kwargs: *id001
+      segments:
+        train:
+        - '2011-01-01'
+        - '2018-12-31'
+        valid:
+        - '2019-01-01'
+        - '2019-12-31'
+        test:
+        - '2020-01-01'
+        - '2020-09-25'
+  record:
+  - class: SignalRecord
+    module_path: qlib.workflow.record_temp
+    kwargs:
+      model: <MODEL>
+      dataset: <DATASET>
+  - class: SigAnaRecord
+    module_path: qlib.workflow.record_temp
+    kwargs:
+      ana_long_short: false
+      ann_scaler: 252
+  - class: PortAnaRecord
+    module_path: qlib.workflow.record_temp
+    kwargs:
+      config: *id002

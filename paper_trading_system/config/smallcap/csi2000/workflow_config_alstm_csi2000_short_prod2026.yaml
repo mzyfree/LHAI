@@ -1,0 +1,122 @@
+qlib_init:
+  provider_uri: /Users/Dylan.Min/Documents/Code/learn/LHAI/paper_trading_system/data/current
+  region: cn
+market: csi2000
+benchmark: SH000932
+data_handler_config: &id001
+  start_time: '2021-01-01'
+  end_time: '2026-05-18'
+  fit_start_time: '2021-01-01'
+  fit_end_time: '2024-12-31'
+  instruments: csi2000
+  infer_processors:
+  - class: FilterCol
+    kwargs:
+      fields_group: feature
+      col_list:
+      - RESI5
+      - WVMA5
+      - RSQR5
+      - KLEN
+      - RSQR10
+      - CORR5
+      - CORD5
+      - CORR10
+      - ROC60
+      - RESI10
+      - VSTD5
+      - RSQR60
+      - CORR60
+      - WVMA60
+      - STD5
+      - RSQR20
+      - CORD60
+      - CORD10
+      - CORR20
+      - KLOW
+  - class: RobustZScoreNorm
+    kwargs:
+      fields_group: feature
+      clip_outlier: true
+  - class: Fillna
+    kwargs:
+      fields_group: feature
+  learn_processors:
+  - class: DropnaLabel
+  - class: CSRankNorm
+    kwargs:
+      fields_group: label
+  label:
+  - Ref($close, -2) / Ref($close, -1) - 1
+port_analysis_config: &id002
+  strategy:
+    class: TopkDropoutStrategy
+    module_path: qlib.contrib.strategy
+    kwargs:
+      signal: <PRED>
+      topk: 20
+      n_drop: 2
+  backtest:
+    start_time: '2026-01-01'
+    end_time: '2026-05-18'
+    account: 100000000
+    benchmark: SH000932
+    exchange_kwargs:
+      limit_threshold: 0.095
+      deal_price: close
+      open_cost: 0.0005
+      close_cost: 0.0015
+      min_cost: 5
+      codes: csi2000
+task:
+  model:
+    class: ALSTM
+    module_path: qlib.contrib.model.pytorch_alstm_ts
+    kwargs:
+      d_feat: 20
+      hidden_size: 64
+      num_layers: 2
+      dropout: 0.0
+      n_epochs: 120
+      lr: 1e-3
+      early_stop: 15
+      batch_size: 800
+      metric: loss
+      loss: mse
+      n_jobs: 20
+      GPU: 0
+      rnn_type: GRU
+  dataset:
+    class: TSDatasetH
+    module_path: qlib.data.dataset
+    kwargs:
+      handler:
+        class: Alpha158
+        module_path: qlib.contrib.data.handler
+        kwargs: *id001
+      segments:
+        train:
+        - '2021-01-01'
+        - '2024-12-31'
+        valid:
+        - '2025-01-01'
+        - '2025-12-31'
+        test:
+        - '2026-01-01'
+        - '2026-05-18'
+      step_len: 20
+  record:
+  - class: SignalRecord
+    module_path: qlib.workflow.record_temp
+    kwargs:
+      model: <MODEL>
+      dataset: <DATASET>
+  - class: SigAnaRecord
+    module_path: qlib.workflow.record_temp
+    kwargs:
+      ana_long_short: false
+      ann_scaler: 252
+  - class: PortAnaRecord
+    module_path: qlib.workflow.record_temp
+    kwargs:
+      config: *id002
