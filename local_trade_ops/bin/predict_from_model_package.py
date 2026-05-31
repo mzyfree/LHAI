@@ -36,17 +36,22 @@ def latest_calendar_date(provider_uri: Path) -> str:
 
 def ensure_extracted(package_path: Path, extract_dir: Path) -> Path:
     extract_dir.mkdir(parents=True, exist_ok=True)
-    candidates = [p for p in extract_dir.iterdir() if p.is_dir() and p.name.startswith("csi1000_main_")]
-    if candidates:
-        return sorted(candidates)[-1]
-
     if not package_path.exists():
         raise SystemExit(f"Model package not found: {package_path}")
 
     with tarfile.open(package_path, "r:gz") as tar:
+        package_roots = sorted({
+            Path(member.name).parts[0]
+            for member in tar.getmembers()
+            if Path(member.name).parts and Path(member.name).parts[0].startswith("csi1000_main_")
+        })
+        for root in reversed(package_roots):
+            candidate = extract_dir / root
+            if candidate.is_dir():
+                return candidate
         tar.extractall(extract_dir)
 
-    candidates = [p for p in extract_dir.iterdir() if p.is_dir() and p.name.startswith("csi1000_main_")]
+    candidates = [extract_dir / root for root in package_roots if (extract_dir / root).is_dir()]
     if not candidates:
         raise SystemExit(f"No csi1000_main_* directory found after extracting: {package_path}")
     return sorted(candidates)[-1]
@@ -63,7 +68,12 @@ def load_task(model_dir: Path) -> dict:
 
 def build_dataset(task: dict, end_date: str) -> Dataset:
     dataset_config = copy.deepcopy(task["dataset"])
-    dataset_config["kwargs"]["handler"]["kwargs"]["end_time"] = end_date
+    handler_kwargs = dataset_config["kwargs"]["handler"]["kwargs"]
+    handler_kwargs["end_time"] = end_date
+    # Daily live inference cannot know the next-day label for the newest bar.
+    # Training configs use DropnaLabel in learn_processors, which would drop
+    # that newest bar and make T close -> T+1 open trading impossible.
+    handler_kwargs["learn_processors"] = []
     dataset_config["kwargs"]["segments"]["test"] = ["2026-01-01", end_date]
     return init_instance_by_config(dataset_config, accept_types=Dataset)
 
