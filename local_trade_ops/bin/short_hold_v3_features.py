@@ -20,6 +20,7 @@ class V3FeatureColumns:
         "ret_3d",
         "amplitude_1d",
         "amount_mean_3d",
+        "turnover_change_5",
         "distance_to_limit_up",
         "limit_up_pct",
     )
@@ -160,7 +161,10 @@ def build_inference_features(candidates: pd.DataFrame, ohlcv: pd.DataFrame, sign
         close = _safe_float(last.get("close"))
         high = _safe_float(last.get("high"))
         low = _safe_float(last.get("low"))
+        amount = _safe_float(last.get("amount"))
         prev_close = _safe_float(prev.get("close")) if prev is not None else float("nan")
+        amount_mean_3d = _safe_float(pd.to_numeric(hist.tail(3).get("amount"), errors="coerce").mean())
+        amount_mean_5d = _safe_float(pd.to_numeric(hist.tail(5).get("amount"), errors="coerce").mean())
         limit_pct = stock_limit_up_pct(instrument)
         theoretical_limit = prev_close * (1.0 + limit_pct) if np.isfinite(prev_close) else float("nan")
 
@@ -171,12 +175,13 @@ def build_inference_features(candidates: pd.DataFrame, ohlcv: pd.DataFrame, sign
                 "return_score": _candidate_score(candidate, "return_score", "score"),
                 "model_rank": _candidate_score(candidate, "model_rank", "rank"),
                 "close": close,
-                "amount": _safe_float(last.get("amount")),
+                "amount": amount,
                 "volume": _safe_float(last.get("volume")),
                 "ret_1d": _safe_ratio(close, prev_close),
                 "ret_3d": _safe_ratio(close, first_in_3d.get("close")),
                 "amplitude_1d": (high - low) / close if np.isfinite(high) and np.isfinite(low) and close else float("nan"),
-                "amount_mean_3d": _safe_float(pd.to_numeric(hist.tail(3).get("amount"), errors="coerce").mean()),
+                "amount_mean_3d": amount_mean_3d,
+                "turnover_change_5": _safe_ratio(amount, amount_mean_5d),
                 "distance_to_limit_up": _safe_ratio(theoretical_limit, close),
                 "limit_up_pct": limit_pct,
             }

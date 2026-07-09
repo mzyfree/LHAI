@@ -88,6 +88,7 @@ class ShortHoldV3FeatureTests(unittest.TestCase):
             "instrument",
             "ret_1d",
             "amount_mean_3d",
+            "turnover_change_5",
             "distance_to_limit_up",
             "limit_up_pct",
         ]:
@@ -95,6 +96,7 @@ class ShortHoldV3FeatureTests(unittest.TestCase):
 
         self.assertAlmostEqual(float(features.loc[0, "ret_1d"]), 10.5 / 10.2 - 1.0, places=8)
         self.assertAlmostEqual(float(features.loc[0, "amount_mean_3d"]), (10_200_000 + 12_600_000) / 2, places=8)
+        self.assertAlmostEqual(float(features.loc[0, "turnover_change_5"]), 12_600_000 / 11_400_000 - 1.0, places=8)
         self.assertAlmostEqual(float(features.loc[1, "limit_up_pct"]), 0.20, places=8)
 
     def test_build_training_labels_uses_future_dates_for_labels(self):

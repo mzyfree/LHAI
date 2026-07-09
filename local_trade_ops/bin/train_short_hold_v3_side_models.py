@@ -20,8 +20,10 @@ from bin.short_hold_v3_features import V3FeatureColumns
 from bin.short_hold_v3_side_model import QuantileSideModel
 
 
-BUYABILITY_LABEL = "buyability_bad_label"
-STRONG_LABEL = "strong_next_label"
+BUYABILITY_LABEL = "buyability_bad"
+STRONG_LABEL = "strong_label"
+BUYABILITY_LABEL_ALIASES = ("buyability_bad_label",)
+STRONG_LABEL_ALIASES = ("strong_next_label",)
 BUYABILITY_ARTIFACT = "buyability_model.pkl"
 STRONG_ARTIFACT = "strong_model.pkl"
 METADATA_ARTIFACT = "metadata.json"
@@ -34,12 +36,14 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def _required_columns() -> set[str]:
-    return set(V3FeatureColumns().numeric) | {
-        "turnover_change_5",
-        BUYABILITY_LABEL,
-        STRONG_LABEL,
-    }
+def _resolve_label_column(samples: pd.DataFrame, primary: str, aliases: tuple[str, ...]) -> str:
+    if primary in samples.columns:
+        return primary
+    for alias in aliases:
+        if alias in samples.columns:
+            return alias
+    choices = ", ".join((primary, *aliases))
+    raise ValueError(f"sample file is missing required label column; expected one of: {choices}")
 
 
 def _pickle_bytes(model: QuantileSideModel) -> bytes:
@@ -75,10 +79,11 @@ def main() -> int:
     samples_path = Path(args.samples)
     samples = pd.read_csv(samples_path)
     feature_columns = list(V3FeatureColumns().numeric)
-    required = _required_columns()
-    missing = sorted(required - set(samples.columns))
+    missing = sorted(set(feature_columns) - set(samples.columns))
     if missing:
         raise ValueError(f"sample file {samples_path} is missing required columns: {missing}")
+    buyability_label = _resolve_label_column(samples, BUYABILITY_LABEL, BUYABILITY_LABEL_ALIASES)
+    strong_label = _resolve_label_column(samples, STRONG_LABEL, STRONG_LABEL_ALIASES)
     if samples.empty:
         raise ValueError(f"sample file {samples_path} contains no rows")
 
@@ -89,18 +94,18 @@ def main() -> int:
         "distance_to_limit_up",
         "low",
         invalid_probability=0.95,
-    ).fit(samples, BUYABILITY_LABEL)
+    ).fit(samples, buyability_label)
     strong_model = QuantileSideModel(
         "turnover_change_5",
         "high",
         invalid_probability=0.05,
-    ).fit(samples, STRONG_LABEL)
+    ).fit(samples, strong_label)
 
     metadata = {
         "feature_columns": feature_columns,
         "rows": int(len(samples)),
-        "buyability_label": BUYABILITY_LABEL,
-        "strong_label": STRONG_LABEL,
+        "buyability_label": buyability_label,
+        "strong_label": strong_label,
         "model_type": "quantile_side_model",
         "models": {
             BUYABILITY_ARTIFACT: dict(buyability_model.training_summary),

@@ -15,6 +15,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bin.short_hold_v3_features import V3FeatureColumns
+from bin.short_hold_v3_features import build_training_labels
 from bin.short_hold_v3_side_model import QuantileSideModel
 
 
@@ -25,9 +26,8 @@ PYTHON = Path(sys.executable)
 def _sample_columns() -> list[str]:
     return [
         *V3FeatureColumns().numeric,
-        "turnover_change_5",
-        "buyability_bad_label",
-        "strong_next_label",
+        "buyability_bad",
+        "strong_label",
     ]
 
 
@@ -39,12 +39,77 @@ def _sample_frame() -> pd.DataFrame:
             {
                 "distance_to_limit_up": [0.09, 0.07, 0.05, 0.03, 0.02, 0.015, 0.01, 0.005][index],
                 "turnover_change_5": [0.1, 0.2, 0.4, 0.8, 1.0, 1.2, 1.6, 2.0][index],
-                "buyability_bad_label": int(index in {5, 6, 7}),
-                "strong_next_label": int(index in {4, 6, 7}),
+                "buyability_bad": int(index in {5, 6, 7}),
+                "strong_label": int(index in {4, 6, 7}),
             }
         )
         rows.append(row)
     return pd.DataFrame(rows, columns=_sample_columns())
+
+
+def _build_training_label_sample_frame() -> pd.DataFrame:
+    index = pd.MultiIndex.from_tuples(
+        [
+            ("2026-06-10", "SH600001"),
+            ("2026-06-11", "SH600001"),
+            ("2026-06-12", "SH600001"),
+            ("2026-06-15", "SH600001"),
+            ("2026-06-10", "SZ000001"),
+            ("2026-06-11", "SZ000001"),
+            ("2026-06-12", "SZ000001"),
+            ("2026-06-15", "SZ000001"),
+            ("2026-06-10", "SH600002"),
+            ("2026-06-11", "SH600002"),
+            ("2026-06-12", "SH600002"),
+            ("2026-06-15", "SH600002"),
+        ],
+        names=["datetime", "instrument"],
+    )
+    ohlcv = pd.DataFrame(
+        {
+            "open": [10.0, 10.3, 10.8, 11.0, 8.0, 8.3, 9.0, 9.9, 20.0, 20.1, 20.3, 20.0],
+            "high": [10.4, 10.8, 11.2, 11.4, 8.4, 8.7, 9.9, 10.4, 20.2, 20.4, 20.5, 20.1],
+            "low": [9.9, 10.1, 10.6, 10.9, 7.9, 8.1, 8.9, 9.6, 19.8, 19.9, 20.0, 19.8],
+            "close": [10.2, 10.5, 11.0, 11.3, 8.2, 8.5, 9.1, 10.1, 20.0, 20.2, 20.1, 20.2],
+            "volume": [1000, 1200, 1500, 1400, 900, 950, 1000, 1100, 1500, 1500, 1500, 1500],
+            "amount": [
+                10_200_000,
+                12_600_000,
+                16_500_000,
+                15_820_000,
+                7_380_000,
+                8_075_000,
+                9_100_000,
+                11_110_000,
+                30_000_000,
+                30_300_000,
+                30_150_000,
+                30_300_000,
+            ],
+        },
+        index=index,
+    )
+    ohlcv.index = pd.MultiIndex.from_arrays(
+        [
+            pd.to_datetime(ohlcv.index.get_level_values("datetime")),
+            ohlcv.index.get_level_values("instrument"),
+        ],
+        names=["datetime", "instrument"],
+    )
+    candidates = pd.DataFrame(
+        {
+            "instrument": ["SH600001", "SZ000001", "SH600002"],
+            "return_score": [2.0, 4.0, 1.0],
+            "model_rank": [2, 1, 3],
+        }
+    )
+    return build_training_labels(
+        candidates,
+        ohlcv,
+        signal_date=pd.Timestamp("2026-06-11"),
+        entry_date=pd.Timestamp("2026-06-12"),
+        exit_date=pd.Timestamp("2026-06-15"),
+    )
 
 
 def _run_trainer(samples_path: Path, output_dir: Path) -> subprocess.CompletedProcess[str]:
@@ -101,7 +166,7 @@ class ShortHoldV3SideModelTrainerTests(unittest.TestCase):
             tmp = Path(tmpdir)
             samples_path = tmp / "samples.csv"
             output_dir = tmp / "models"
-            _sample_frame().to_csv(samples_path, index=False)
+            _build_training_label_sample_frame().to_csv(samples_path, index=False)
 
             result = _run_trainer(samples_path, output_dir)
 
@@ -109,7 +174,9 @@ class ShortHoldV3SideModelTrainerTests(unittest.TestCase):
             self.assertTrue((output_dir / "buyability_model.pkl").exists())
             self.assertTrue((output_dir / "strong_model.pkl").exists())
             metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
-            self.assertEqual(metadata["rows"], 8)
+            self.assertEqual(metadata["rows"], 3)
+            self.assertEqual(metadata["buyability_label"], "buyability_bad")
+            self.assertEqual(metadata["strong_label"], "strong_label")
             self.assertEqual(metadata["models"]["buyability_model.pkl"]["column"], "distance_to_limit_up")
             self.assertEqual(metadata["models"]["strong_model.pkl"]["column"], "turnover_change_5")
             self.assertEqual(metadata["models"]["buyability_model.pkl"]["invalid_probability"], 0.95)
@@ -158,6 +225,26 @@ class ShortHoldV3SideModelTrainerTests(unittest.TestCase):
             self.assertIn("contains no rows", result.stderr)
             self.assertFalse((output_dir / "buyability_model.pkl").exists())
 
+    def test_legacy_label_aliases_are_accepted_for_compatibility(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            samples = _sample_frame().rename(
+                columns={
+                    "buyability_bad": "buyability_bad_label",
+                    "strong_label": "strong_next_label",
+                }
+            )
+            samples_path = tmp / "samples.csv"
+            output_dir = tmp / "models"
+            samples.to_csv(samples_path, index=False)
+
+            result = _run_trainer(samples_path, output_dir)
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            metadata = json.loads((output_dir / "metadata.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["buyability_label"], "buyability_bad_label")
+            self.assertEqual(metadata["strong_label"], "strong_next_label")
+
     def test_invalid_numeric_values_are_not_treated_as_zero_during_training(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
@@ -178,8 +265,8 @@ class ShortHoldV3SideModelTrainerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             samples = _sample_frame()
-            samples["buyability_bad_label"] = 0
-            samples["strong_next_label"] = 0
+            samples["buyability_bad"] = 0
+            samples["strong_label"] = 0
             samples_path = tmp / "samples.csv"
             output_dir = tmp / "models"
             samples.to_csv(samples_path, index=False)
