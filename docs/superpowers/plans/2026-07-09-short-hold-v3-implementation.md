@@ -794,7 +794,7 @@ bash -n bin/prepare_short_hold_orders.sh
 
 Expected: no output from `py_compile`, no output from `bash -n`, exit code `0`.
 
-- [ ] **Step 11: Commit generator integration**
+- [x] **Step 11: Commit generator integration**
 
 Run:
 
@@ -889,7 +889,7 @@ Expected:
 The short-hold page loads, existing v2 rows still render, and v3 score columns appear only when the CSV contains those fields.
 ```
 
-- [ ] **Step 6: Commit UI update**
+- [x] **Step 6: Commit UI update**
 
 Run:
 
@@ -994,7 +994,7 @@ CSV
 
 Expected output contains rows labeled `v2` and `v3`, and writes `tmp/short_hold_v3_compare.csv`.
 
-- [ ] **Step 4: Commit backtest CLI**
+- [x] **Step 4: Commit backtest CLI**
 
 Run:
 
@@ -1062,7 +1062,7 @@ SHORT_HOLD_SCORING_MODE=v2
 Restart the local backend and regenerate the short-hold order list.
 ```
 
-- [ ] **Step 2: Commit docs**
+- [x] **Step 2: Commit docs**
 
 Run:
 
@@ -1150,7 +1150,7 @@ Fill template:
 
 The generated short-hold order CSV contains `return_score`, `buyability_risk`, `strong_prob`, `final_score`, and `score_source`.
 
-- [ ] **Step 5: Inspect git diff**
+- [x] **Step 5: Inspect git diff**
 
 Run:
 
