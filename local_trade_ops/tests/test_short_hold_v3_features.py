@@ -9,6 +9,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from bin.short_hold_v3_features import (
+    V3FeatureColumns,
     build_inference_features,
     build_training_labels,
     stock_limit_up_pct,
@@ -113,6 +114,8 @@ class ShortHoldV3FeatureTests(unittest.TestCase):
         )
 
         self.assertEqual(list(labels["instrument"]), ["SH600001", "SZ000001"])
+        self.assertIn("signal_date", labels.columns)
+        self.assertEqual(pd.Timestamp(labels.loc[0, "signal_date"]), pd.Timestamp("2026-06-11"))
         self.assertAlmostEqual(float(labels.loc[0, "realized_return"]), 11.6 / 11.0 - 1.0, places=8)
         self.assertEqual(int(labels.loc[0, "open_gt_5pct"]), 0)
         self.assertEqual(int(labels.loc[0, "buyability_bad"]), 0)
@@ -121,6 +124,81 @@ class ShortHoldV3FeatureTests(unittest.TestCase):
         self.assertEqual(int(labels.loc[1, "open_gt_5pct"]), 1)
         self.assertEqual(int(labels.loc[1, "buyability_bad"]), 1)
         self.assertEqual(int(labels.loc[1, "strong_label"]), 1)
+
+    def test_candidate_scores_fall_back_when_primary_value_is_invalid(self):
+        rows = pd.DataFrame(
+            {
+                "instrument": ["SH600001"],
+                "return_score": [float("nan")],
+                "score": [9.5],
+                "model_rank": [""],
+                "rank": [4],
+            }
+        )
+
+        features = build_inference_features(rows, self.ohlcv, pd.Timestamp("2026-06-11"))
+
+        self.assertAlmostEqual(float(features.loc[0, "return_score"]), 9.5, places=8)
+        self.assertAlmostEqual(float(features.loc[0, "model_rank"]), 4.0, places=8)
+
+    def test_empty_inference_and_training_results_keep_stable_schema(self):
+        rows = pd.DataFrame({"instrument": ["SH999999"], "return_score": [1.0], "model_rank": [1]})
+
+        empty_features = build_inference_features(pd.DataFrame(), pd.DataFrame(), pd.Timestamp("2026-06-11"))
+        self.assertTrue(empty_features.empty)
+        self.assertIn("instrument", empty_features.columns)
+        self.assertIn("return_score", empty_features.columns)
+
+        empty_labels = build_training_labels(
+            pd.DataFrame(),
+            pd.DataFrame(),
+            signal_date=pd.Timestamp("2026-06-11"),
+            entry_date=pd.Timestamp("2026-06-12"),
+            exit_date=pd.Timestamp("2026-06-15"),
+        )
+        self.assertTrue(empty_labels.empty)
+        self.assertIn("signal_date", empty_labels.columns)
+        self.assertIn("strong_label", empty_labels.columns)
+
+        features = build_inference_features(rows, self.ohlcv, pd.Timestamp("2026-06-11"))
+
+        expected_feature_columns = ["instrument", *V3FeatureColumns().numeric]
+        self.assertTrue(features.empty)
+        for column in expected_feature_columns:
+            self.assertIn(column, features.columns)
+
+        labels = build_training_labels(
+            rows,
+            self.ohlcv,
+            signal_date=pd.Timestamp("2026-06-11"),
+            entry_date=pd.Timestamp("2026-06-12"),
+            exit_date=pd.Timestamp("2026-06-15"),
+        )
+
+        expected_label_columns = [
+            *expected_feature_columns,
+            "signal_date",
+            "entry_date",
+            "exit_date",
+            "entry_open",
+            "exit_close",
+            "entry_gap",
+            "realized_return",
+            "open_gt_5pct",
+            "open_limit_up",
+            "buyability_bad",
+            "strong_label",
+        ]
+        self.assertTrue(labels.empty)
+        for column in expected_label_columns:
+            self.assertIn(column, labels.columns)
+
+    def test_duplicate_ohlcv_keys_raise_value_error(self):
+        duplicate_ohlcv = pd.concat([self.ohlcv, self.ohlcv.iloc[[0]]])
+        rows = pd.DataFrame({"instrument": ["SH600001"], "return_score": [2.0], "model_rank": [1]})
+
+        with self.assertRaisesRegex(ValueError, "duplicate OHLCV rows"):
+            build_inference_features(rows, duplicate_ohlcv, pd.Timestamp("2026-06-11"))
 
 
 if __name__ == "__main__":

@@ -25,6 +25,21 @@ class V3FeatureColumns:
     )
 
 
+LABEL_COLUMNS: tuple[str, ...] = (
+    "signal_date",
+    "entry_date",
+    "exit_date",
+    "entry_open",
+    "exit_close",
+    "entry_gap",
+    "realized_return",
+    "open_gt_5pct",
+    "open_limit_up",
+    "buyability_bad",
+    "strong_label",
+)
+
+
 def stock_limit_up_pct(instrument: str) -> float:
     code = str(instrument).upper()
     if code.startswith("SZ300") or code.startswith("SH688"):
@@ -62,12 +77,18 @@ def _as_ohlcv_index(ohlcv: pd.DataFrame) -> pd.DataFrame:
     dates = pd.to_datetime(frame.index.get_level_values("datetime"))
     instruments = frame.index.get_level_values("instrument").astype(str)
     frame.index = pd.MultiIndex.from_arrays([dates, instruments], names=["datetime", "instrument"])
+    if frame.index.duplicated().any():
+        duplicate = frame.index[frame.index.duplicated()][0]
+        raise ValueError(f"duplicate OHLCV rows for {duplicate[1]} on {duplicate[0].date()}")
     return frame.sort_index()
 
 
 def _as_candidate_frame(candidates: pd.DataFrame) -> pd.DataFrame:
     frame = candidates.copy()
     if "instrument" not in frame.columns:
+        if frame.empty:
+            frame["instrument"] = pd.Series(dtype="object")
+            return frame.reset_index(drop=True)
         if isinstance(frame.index, pd.MultiIndex) and "instrument" in frame.index.names:
             frame = frame.reset_index("instrument")
         elif frame.index.name == "instrument":
@@ -96,13 +117,33 @@ def _row_at(ohlcv: pd.DataFrame, instrument: str, date: pd.Timestamp) -> pd.Seri
 
 
 def _candidate_score(candidate: dict[str, object], primary: str, fallback: str) -> float:
-    if primary in candidate:
-        return _safe_float(candidate.get(primary))
+    primary_value = _safe_float(candidate.get(primary))
+    if np.isfinite(primary_value):
+        return primary_value
     return _safe_float(candidate.get(fallback))
+
+
+def _unique_columns(columns: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for column in columns:
+        if column in seen:
+            continue
+        seen.add(column)
+        result.append(column)
+    return result
+
+
+def _feature_columns(candidate_columns: Iterable[str] = ()) -> list[str]:
+    return _unique_columns(["instrument", *V3FeatureColumns().numeric, *candidate_columns])
 
 
 def build_inference_features(candidates: pd.DataFrame, ohlcv: pd.DataFrame, signal_date: pd.Timestamp) -> pd.DataFrame:
     candidate_frame = _as_candidate_frame(candidates)
+    columns = _feature_columns(candidate_frame.columns)
+    if candidate_frame.empty:
+        return pd.DataFrame(columns=columns)
+
     ohlcv_frame = _as_ohlcv_index(ohlcv)
     signal_ts = pd.Timestamp(signal_date)
     rows: list[dict[str, object]] = []
@@ -142,7 +183,7 @@ def build_inference_features(candidates: pd.DataFrame, ohlcv: pd.DataFrame, sign
         )
         rows.append(row)
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=columns)
 
 
 def build_training_labels(
@@ -153,8 +194,14 @@ def build_training_labels(
     exit_date: pd.Timestamp,
     strong_return_threshold: float = 0.06,
 ) -> pd.DataFrame:
+    candidate_frame = _as_candidate_frame(candidates)
+    if candidate_frame.empty:
+        return pd.DataFrame(columns=_unique_columns([*_feature_columns(candidate_frame.columns), *LABEL_COLUMNS]))
+
     ohlcv_frame = _as_ohlcv_index(ohlcv)
-    features = build_inference_features(candidates, ohlcv_frame, pd.Timestamp(signal_date))
+    signal_ts = pd.Timestamp(signal_date)
+    features = build_inference_features(candidate_frame, ohlcv_frame, signal_ts)
+    columns = _unique_columns([*features.columns, *LABEL_COLUMNS])
     rows: list[dict[str, object]] = []
 
     for feature in features.to_dict("records"):
@@ -175,6 +222,7 @@ def build_training_labels(
         row = dict(feature)
         row.update(
             {
+                "signal_date": signal_ts,
                 "entry_date": pd.Timestamp(entry_date),
                 "exit_date": pd.Timestamp(exit_date),
                 "entry_open": entry_open,
@@ -189,7 +237,7 @@ def build_training_labels(
         )
         rows.append(row)
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=columns)
 
 
 def load_qlib_ohlcv(instruments: Iterable[str], start_date: object, end_date: object) -> pd.DataFrame:
