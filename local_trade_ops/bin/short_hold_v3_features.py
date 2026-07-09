@@ -96,7 +96,7 @@ def _as_candidate_frame(candidates: pd.DataFrame) -> pd.DataFrame:
         else:
             raise KeyError("candidates must include an instrument column")
     frame["instrument"] = frame["instrument"].astype(str)
-    return frame.reset_index(drop=True)
+    return frame.drop_duplicates(subset=["instrument"], keep="first").reset_index(drop=True)
 
 
 def _history_through(ohlcv: pd.DataFrame, instrument: str, end_date: pd.Timestamp, window: int) -> pd.DataFrame:

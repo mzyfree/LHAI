@@ -141,6 +141,23 @@ class ShortHoldV3FeatureTests(unittest.TestCase):
         self.assertAlmostEqual(float(features.loc[0, "return_score"]), 9.5, places=8)
         self.assertAlmostEqual(float(features.loc[0, "model_rank"]), 4.0, places=8)
 
+    def test_duplicate_candidate_instruments_keep_first_row(self):
+        rows = pd.DataFrame(
+            {
+                "instrument": ["SH600001", "SH600001"],
+                "return_score": [2.0, 9.0],
+                "score": [3.0, 10.0],
+                "model_rank": [1, 99],
+            }
+        )
+
+        features = build_inference_features(rows, self.ohlcv, pd.Timestamp("2026-06-11"))
+
+        self.assertEqual(list(features["instrument"]), ["SH600001"])
+        self.assertAlmostEqual(float(features.loc[0, "return_score"]), 2.0, places=8)
+        self.assertAlmostEqual(float(features.loc[0, "score"]), 3.0, places=8)
+        self.assertAlmostEqual(float(features.loc[0, "model_rank"]), 1.0, places=8)
+
     def test_empty_inference_and_training_results_keep_stable_schema(self):
         rows = pd.DataFrame({"instrument": ["SH999999"], "return_score": [1.0], "model_rank": [1]})
 
