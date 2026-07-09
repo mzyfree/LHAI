@@ -344,6 +344,10 @@ function loadShortHoldStatus() {
       buyBudgetMode: env.SHORT_HOLD_BUY_BUDGET_MODE || env.BUY_BUDGET_MODE || "capital_pool",
       reserveCashPct: env.SHORT_HOLD_RESERVE_CASH_PCT || "0.02",
       scoreTemperature: env.SHORT_HOLD_SCORE_TEMPERATURE || "1.0",
+      scoringMode: env.SHORT_HOLD_SCORING_MODE || "v2",
+      v3Alpha: env.SHORT_HOLD_V3_ALPHA || "1.0",
+      v3Beta: env.SHORT_HOLD_V3_BETA || "2.0",
+      v3Gamma: env.SHORT_HOLD_V3_GAMMA || "0.0",
     },
     data: {
       currentLink: fileInfo(qlibDir),
@@ -440,6 +444,28 @@ function formatNumber(value: unknown, digits: number): string {
   return n === null ? "" : n.toFixed(digits);
 }
 
+function formatPercent(value: unknown, digits = 2): string {
+  const n = finiteNumber(value);
+  return n === null ? "" : `${(n * 100).toFixed(digits)}%`;
+}
+
+function v3ValueColumns(row: Record<string, string>): Record<string, string> {
+  const hasV3Values = [row.final_score, row.buyability_risk, row.strong_prob, row.liquidity_risk].some(
+    (value) => finiteNumber(value) !== null,
+  );
+  if (!hasV3Values) {
+    return {};
+  }
+  return {
+    return_score: formatNumber(row.return_score || row.score, 6),
+    final_score: formatNumber(row.final_score, 6),
+    buyability_risk: formatPercent(row.buyability_risk),
+    strong_prob: formatPercent(row.strong_prob),
+    liquidity_risk: formatNumber(row.liquidity_risk, 4),
+    score_source: row.score_source || "v3",
+  };
+}
+
 function shortHoldRecentFilteredTopRows(stateDir: string, limit = 5): Record<string, string>[] {
   const files = listFiles(stateDir, "short_hold_candidate_review_")
     .filter((name) => name.endsWith(".csv"))
@@ -454,7 +480,10 @@ function shortHoldRecentFilteredTopRows(stateDir: string, limit = 5): Record<str
         const rankA = finiteNumber(a.model_rank) ?? Number.POSITIVE_INFINITY;
         const rankB = finiteNumber(b.model_rank) ?? Number.POSITIVE_INFINITY;
         if (rankA !== rankB) return rankA - rankB;
-        return (finiteNumber(b.score) ?? Number.NEGATIVE_INFINITY) - (finiteNumber(a.score) ?? Number.NEGATIVE_INFINITY);
+        return (
+          (finiteNumber(b.final_score || b.score) ?? Number.NEGATIVE_INFINITY) -
+          (finiteNumber(a.final_score || a.score) ?? Number.NEGATIVE_INFINITY)
+        );
       });
     const top = rows[0];
     if (!top || !top.signal_date || bySignalDate.has(top.signal_date)) continue;
@@ -468,6 +497,7 @@ function shortHoldRecentFilteredTopRows(stateDir: string, limit = 5): Record<str
       role: top.order_role || "",
       model_rank: top.model_rank || "",
       score: formatNumber(top.score, 6),
+      ...v3ValueColumns(top),
       ref_price: formatNumber(top.estimated_price, 2),
       price_5pct: price === null ? "" : (price * 1.05).toFixed(2),
       shares: top.planned_shares || "",
@@ -501,6 +531,7 @@ function shortHoldTicketRows(
     signal_score: (latestSignalScore.get(row.instrument) || (row.action === "BUY" ? row.score : ""))
       ? Number(latestSignalScore.get(row.instrument) || row.score).toFixed(6)
       : "",
+    ...v3ValueColumns(row),
     alloc_weight: row.softmax_weight ? (Number(row.softmax_weight) * 100).toFixed(2) + "%" : "",
     target_value: row.target_value ? Number(row.target_value).toFixed(0) : "",
     planned_value: row.planned_value ? Number(row.planned_value).toFixed(0) : "",
@@ -980,10 +1011,51 @@ function shortHoldHtml() {
     function escapeHtml(text) {
       return String(text ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
     }
+    const LABELS = {
+      role: '角色',
+      order_role: '角色',
+      signal_date: '信号日',
+      execution_date: '执行日',
+      exit_date: '退出日',
+      code: '代码',
+      instrument: '代码',
+      action: '方向',
+      shares: '股数',
+      ref_price: '参考价',
+      price_3pct: '3%提示',
+      price_5pct: '5%红线',
+      model_rank: '模型排名',
+      score: '原始分',
+      entry_score: '入仓分',
+      signal_score: '当日分',
+      return_score: '收益分',
+      final_score: '最终分',
+      buyability_risk: '买入风险',
+      strong_prob: '强势概率',
+      liquidity_risk: '流动性风险',
+      score_source: '打分源',
+      alloc_weight: '分配权重',
+      target_value: '目标金额',
+      planned_value: '计划金额',
+      note: '说明',
+      filter_status: '过滤状态',
+      filter_reason: '过滤原因',
+      close: '收盘价',
+      amount20: '20日成交额',
+      status: '状态',
+    };
+    function tableColumns(rows) {
+      const seen = new Set();
+      const cols = [];
+      rows.forEach(row => Object.keys(row || {}).forEach(col => {
+        if (!seen.has(col)) { seen.add(col); cols.push(col); }
+      }));
+      return cols;
+    }
     function table(rows) {
       if (!rows || !rows.length) return '<p class="muted">暂无</p>';
-      const cols = Object.keys(rows[0]);
-      return '<table><thead><tr>' + cols.map(c => '<th>'+escapeHtml(c)+'</th>').join('') + '</tr></thead><tbody>' +
+      const cols = tableColumns(rows);
+      return '<table><thead><tr>' + cols.map(c => '<th>'+escapeHtml(LABELS[c] || c)+'</th>').join('') + '</tr></thead><tbody>' +
         rows.map(r => '<tr>' + cols.map(c => '<td>'+escapeHtml(r[c] ?? '')+'</td>').join('') + '</tr>').join('') + '</tbody></table>';
     }
     function fillEditor(rows) {
@@ -1046,10 +1118,13 @@ function shortHoldHtml() {
       const timeline = firstBuy
         ? (firstBuy.signal_date + ' 信号；' + firstBuy.execution_date + ' 开盘人工买；' + firstBuy.exit_date + ' 尾盘/收盘卖')
         : '生成清单后会显示具体 signal / execution / exit 日期';
+      const scoringText = s.env.scoringMode === 'v3'
+        ? '当前为 v3 重排：原始分是收益模型分；最终分 = 收益分 - 买入风险惩罚 + 强势概率加分 - 流动性惩罚，用于排序和 softmax 分配。'
+        : '当前为 v2：按原始收益模型分排序和 softmax 分配。';
       document.querySelector('#orders').innerHTML =
         '<h3>近5个信号日 Filter 后 Top1</h3><p class="muted">来源：短持有 candidate review，排除 FILTERED/SKIPPED，只看已经通过过滤并可进入主单或 backup 的 BUY 候选。</p>' + table(s.workflow.recentFilteredTopRows) +
         '<h3>模型 Top5 / 过滤检查</h3><p class="muted">score 是模型原始分；FILTERED 表示不会进入主单/备选池。</p>' + table(s.workflow.modelTopReviewRows) +
-        '<h3>手工下单清单</h3><p class="muted"><b>本轮节奏：</b>' + escapeHtml(timeline) + '。role=primary 是主单；role=backup 是 primary 因涨停/高开/买不进/未成交时使用的组合补位，按释放主单资金重新 softmax 分配。entry_score 是已有持仓当初买入时的入仓分数，没有入仓则为空；signal_score 是最新信号日模型跑出的当天原始分。BUY 的 price_5pct 是最高买入红线；SELL 是到期持仓，优先卖出。</p>' + table(rows) +
+        '<h3>手工下单清单</h3><p class="muted"><b>本轮节奏：</b>' + escapeHtml(timeline) + '。' + escapeHtml(scoringText) + ' role=primary 是主单；role=backup 是 primary 因涨停/高开/买不进/未成交时使用的组合补位，按释放主单资金重新 softmax 分配。入仓分是已有持仓当初买入时的分数，没有入仓则为空；当日分是最新信号日模型跑出的当天原始分。BUY 的 price_5pct 是最高买入红线；SELL 是到期持仓，优先卖出。</p>' + table(rows) +
         '<h3>成交回填</h3><p class="muted">填东方财富「当日成交」里的真实成交股数/均价；没成交填 0 或留空并备注。</p>' + fillEditor(s.workflow.fillTemplateRows) +
         '<div class="submit-row"><button onclick="run(\\'short-hold-apply-fills\\')" class="secondary">提交短持有回填</button></div>' +
         '<p class="muted">最新任务: ' + (s.workflow.latestTask || '-') +
@@ -1069,7 +1144,7 @@ function shortHoldHtml() {
         '</div><h3>状态</h3>' +
         '<p><b>本地最新交易日</b>: ' + (s.data.lastCalendarDate || '-') + ' ｜ 今天=' + s.data.todayLocal + '</p>' +
         '<p><b>今日短持有清单</b>: ' + (s.workflow.brokerTicketOrders?.length ? '已生成 ' + s.workflow.brokerTicketOrders.length + ' 条' : '暂无') + '</p>' +
-        '<p><b>初始资金池</b>: ' + Number(s.env.capital || 100000).toLocaleString('zh-CN') + ' ｜ <b>BUY预算</b>: ' + budgetModeLabel(s.env.buyBudgetMode) + ' ｜ <b>策略</b>: top' + s.env.topk + ' + backup' + s.env.backupCount + ', maxPositionPct=' + s.env.maxPositionPct + ', minAmount=' + s.env.minAmount + ', temperature=' + s.env.scoreTemperature + ', 排除创业板/科创板=' + s.env.excludeRestrictedMarkets + '</p>' +
+        '<p><b>初始资金池</b>: ' + Number(s.env.capital || 100000).toLocaleString('zh-CN') + ' ｜ <b>BUY预算</b>: ' + budgetModeLabel(s.env.buyBudgetMode) + ' ｜ <b>策略</b>: top' + s.env.topk + ' + backup' + s.env.backupCount + ', scoring=' + s.env.scoringMode + ', maxPositionPct=' + s.env.maxPositionPct + ', minAmount=' + s.env.minAmount + ', temperature=' + s.env.scoreTemperature + ', 排除创业板/科创板=' + s.env.excludeRestrictedMarkets + '</p>' +
         '<p><b>数据日历</b>: ' + s.data.calendarTail.join(', ') + '</p>' +
         '<h3>持仓</h3>' + table(s.account.positions);
       if (options.forceOrders || (!isEditingFill() && !hasFillDraft())) renderOrders(s);

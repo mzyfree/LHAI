@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import pickle
 import sys
 from pathlib import Path
 
@@ -41,10 +42,12 @@ def load_env() -> dict[str, str]:
 
 
 def setup_imports(env: dict[str, str]) -> None:
+    ops_home = Path(env["OPS_HOME"]).expanduser().resolve()
     paper_src = Path(env["PAPER_ENGINE_HOME"]).expanduser().resolve() / "src"
     qlib_src = env.get("QLIB_SRC", "").strip()
     if qlib_src:
         sys.path.insert(0, str(Path(qlib_src).expanduser().resolve()))
+    sys.path.insert(0, str(ops_home))
     sys.path.insert(0, str(paper_src))
 
 
@@ -188,6 +191,73 @@ def permission_allowed(inst: str, exclude_restricted: bool) -> bool:
     return not (inst.startswith("SZ300") or inst.startswith("SZ301") or inst.startswith("SH688"))
 
 
+def _order_score_column(candidates: pd.DataFrame) -> str:
+    return "final_score" if "final_score" in candidates.columns else "score"
+
+
+def _v3_extra_values(pick: pd.Series) -> dict[str, object]:
+    extras: dict[str, object] = {}
+    for column in [
+        "return_score",
+        "buyability_risk",
+        "strong_prob",
+        "liquidity_risk",
+        "final_score",
+        "score_source",
+    ]:
+        if column in pick.index:
+            extras[column] = pick.get(column)
+    return extras
+
+
+def _load_side_model(path: Path):
+    with path.open("rb") as handle:
+        return pickle.load(handle)
+
+
+def _apply_v3_scoring(
+    candidates: pd.DataFrame,
+    provider_uri: str,
+    signal_date: pd.Timestamp,
+    side_model_dir: Path,
+    alpha: float,
+    beta: float,
+    gamma: float,
+) -> pd.DataFrame:
+    from bin.short_hold_v3_features import build_inference_features, load_qlib_ohlcv
+    from bin.short_hold_v3_scoring import score_candidates_v3, sort_candidates_for_orders
+    from paper_trading_daily import init_qlib
+
+    if candidates.empty:
+        return candidates.copy()
+
+    buyability_path = side_model_dir / "buyability_model.pkl"
+    strong_path = side_model_dir / "strong_model.pkl"
+    missing = [str(path) for path in [buyability_path, strong_path] if not path.exists()]
+    if missing:
+        raise FileNotFoundError(f"SHORT_HOLD_V3_SIDE_MODEL_DIR missing artifacts: {missing}")
+
+    instruments = candidates["instrument"].astype(str).tolist()
+    start_date = pd.Timestamp(signal_date) - pd.offsets.BDay(60)
+    init_qlib(provider_uri)
+    ohlcv = load_qlib_ohlcv(instruments, start_date, signal_date)
+    features = build_inference_features(candidates, ohlcv, signal_date)
+    if features.empty:
+        return candidates.copy()
+
+    buyability_model = _load_side_model(buyability_path)
+    strong_model = _load_side_model(strong_path)
+    side_scores = pd.DataFrame(
+        {
+            "instrument": features["instrument"].astype(str),
+            "buyability_risk": buyability_model.predict_proba(features)[:, 1],
+            "strong_prob": strong_model.predict_proba(features)[:, 1],
+        }
+    )
+    scored = score_candidates_v3(features, side_scores, alpha=alpha, beta=beta, gamma=gamma)
+    return sort_candidates_for_orders(scored)
+
+
 def main() -> int:
     args = parse_args()
     env = load_env()
@@ -220,6 +290,16 @@ def main() -> int:
     buy_budget_mode = env.get("SHORT_HOLD_BUY_BUDGET_MODE", env.get("BUY_BUDGET_MODE", "capital_pool")).strip().lower()
     score_temperature = float(env.get("SHORT_HOLD_SCORE_TEMPERATURE", "1.0"))
     backup_count = int(env.get("SHORT_HOLD_BACKUP_COUNT", "3"))
+    scoring_mode = env.get("SHORT_HOLD_SCORING_MODE", "v2").strip().lower()
+    v3_side_model_dir = Path(
+        env.get(
+            "SHORT_HOLD_V3_SIDE_MODEL_DIR",
+            str(Path(env["OPS_HOME"]) / "model_packages" / "short_hold_v3_side_models"),
+        )
+    ).expanduser().resolve()
+    v3_alpha = float(env.get("SHORT_HOLD_V3_ALPHA", "1.0"))
+    v3_beta = float(env.get("SHORT_HOLD_V3_BETA", "2.0"))
+    v3_gamma = float(env.get("SHORT_HOLD_V3_GAMMA", "0.0"))
     exclude_restricted_markets = env.get("SHORT_HOLD_EXCLUDE_RESTRICTED_MARKETS", "1").strip() not in {"0", "false", "False", "no", "NO"}
     filter_st = env.get("SHORT_HOLD_FILTER_ST", env.get("FILTER_ST", "1")).strip() not in {"0", "false", "False", "no", "NO"}
     filter_paused = env.get("SHORT_HOLD_FILTER_PAUSED", env.get("FILTER_PAUSED", "1")).strip() not in {"0", "false", "False", "no", "NO"}
@@ -302,6 +382,18 @@ def main() -> int:
     candidates = candidates.loc[
         candidates["instrument"].astype(str).map(lambda inst: permission_allowed(inst, exclude_restricted_markets))
     ].copy()
+    if scoring_mode not in {"v2", "v3"}:
+        raise ValueError("SHORT_HOLD_SCORING_MODE must be v2 or v3")
+    if scoring_mode == "v3":
+        candidates = _apply_v3_scoring(
+            candidates,
+            provider_uri,
+            signal_date,
+            v3_side_model_dir,
+            v3_alpha,
+            v3_beta,
+            v3_gamma,
+        )
 
     prices = load_raw_prices(provider_uri, instruments, signal_date, "close")
     price_map = prices.set_index("instrument")["price"].to_dict()
@@ -353,10 +445,16 @@ def main() -> int:
             "capital_pool, capital_pool_reserved, available_cash, available_cash_reserved"
         )
     available_candidates = candidates.loc[~candidates["instrument"].astype(str).isin(held)].copy()
-    available_candidates = available_candidates.sort_values("score", ascending=False).reset_index(drop=True)
+    if scoring_mode == "v3":
+        from bin.short_hold_v3_scoring import sort_candidates_for_orders
+
+        available_candidates = sort_candidates_for_orders(available_candidates)
+    else:
+        available_candidates = available_candidates.sort_values("score", ascending=False).reset_index(drop=True)
     buy_candidates = available_candidates.head(topk).copy()
     extra_backup_candidates = available_candidates.iloc[topk:].copy()
-    weights_by_inst = softmax_weights(buy_candidates.set_index("instrument")["score"], score_temperature)
+    order_score_column = _order_score_column(buy_candidates)
+    weights_by_inst = softmax_weights(buy_candidates.set_index("instrument")[order_score_column], score_temperature)
     candidate_reviews: list[dict[str, object]] = []
     promoted_backup_instruments: set[str] = set()
     promoted_backup_picks: list[pd.Series] = []
@@ -381,6 +479,7 @@ def main() -> int:
                 "instrument": inst,
                 "model_rank": int(pick.get("model_rank", pick["rank"])),
                 "score": float(pick["score"]),
+                **_v3_extra_values(pick),
                 "estimated_price": price,
                 "softmax_weight": weight,
                 "target_value": target_value,
@@ -410,6 +509,7 @@ def main() -> int:
                 "order_role": "primary",
                 "model_rank": int(pick.get("model_rank", pick["rank"])),
                 "score": float(pick["score"]),
+                **_v3_extra_values(pick),
                 "operator_note": timeline_note,
             }
         )
@@ -428,7 +528,7 @@ def main() -> int:
 
     backup_df = pd.DataFrame(backup_pick_rows)
     backup_weights_by_inst = (
-        softmax_weights(backup_df.set_index("instrument")["score"], score_temperature)
+        softmax_weights(backup_df.set_index("instrument")[_order_score_column(backup_df)], score_temperature)
         if not backup_df.empty
         else pd.Series(dtype=float)
     )
@@ -467,6 +567,7 @@ def main() -> int:
                     "instrument": inst,
                     "model_rank": int(pick.get("model_rank", pick["rank"])),
                     "score": float(pick["score"]),
+                    **_v3_extra_values(pick),
                     "estimated_price": price,
                     "softmax_weight": backup_weight,
                     "target_value": backup_target_value,
@@ -499,6 +600,7 @@ def main() -> int:
                 "order_role": "backup",
                 "model_rank": int(pick.get("model_rank", pick["rank"])),
                 "score": float(pick["score"]),
+                **_v3_extra_values(pick),
                 "operator_note": f"backup 组合：仅 primary 买不进时使用；按释放主单资金重新 softmax；{timeline_note}",
             }
         )
@@ -539,6 +641,7 @@ def main() -> int:
                 "timeline_note": timeline_note,
                 "status": "auto_approved",
                 "strategy": "short_hold_single_peak",
+                "scoring_mode": scoring_mode,
             },
             indent=2,
             sort_keys=True,

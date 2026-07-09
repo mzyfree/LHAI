@@ -23,6 +23,7 @@ bash "${OPS_HOME}/bin/ensure_short_hold_prediction_ready.sh"
 
 echo
 echo "===== STEP 3/3 generate short-hold single-peak ticket ====="
+echo "Short-hold scoring mode: ${SHORT_HOLD_SCORING_MODE:-v2}"
 SHORT_HOLD_PRED_DIR="${SHORT_HOLD_PRED_DIR:-${OPS_HOME}/preds/csi1000_short_hold_v2}"
 export PRED_A="${SHORT_HOLD_PRED_A:-${SHORT_HOLD_PRED_DIR}/xgb_csi1000_long_prod2026.pkl}"
 export PRED_B="${SHORT_HOLD_PRED_B:-${SHORT_HOLD_PRED_DIR}/doubleensemble_csi1000_short_prod2026.pkl}"
