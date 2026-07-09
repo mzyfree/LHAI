@@ -55,12 +55,23 @@ def today_local() -> str:
     return datetime.now().strftime("%Y-%m-%d")
 
 
+def price_thresholds(price: float) -> tuple[str, str]:
+    if not pd.notna(price) or price <= 0:
+        return "", ""
+    return f"{price * 1.03:.2f}", f"{price * 1.05:.2f}"
+
+
 def normalize_task_orders(orders: pd.DataFrame, execution_date: str) -> pd.DataFrame:
     required = ["signal_date", "execution_date", "instrument", "action", "shares", "estimated_price", "reason", "order_type"]
     missing = [col for col in required if col not in orders.columns]
     if missing:
         raise ValueError(f"Live task missing columns: {missing}")
-    out = orders.loc[:, required].copy()
+    optional = ["order_role", "model_rank", "score", "backup_rank"]
+    cols = required + [col for col in optional if col in orders.columns]
+    out = orders.loc[:, cols].copy()
+    if "order_role" not in out.columns:
+        out["order_role"] = "primary"
+    out["order_role"] = out["order_role"].fillna("primary").astype(str)
     out["execution_date"] = out["execution_date"].astype(str)
     if not out["execution_date"].eq(execution_date).all():
         bad = sorted(out.loc[~out["execution_date"].eq(execution_date), "execution_date"].unique())
@@ -72,9 +83,40 @@ def normalize_task_orders(orders: pd.DataFrame, execution_date: str) -> pd.DataF
     out = out[out["action"].isin(["SELL", "BUY"]) & (out["shares"] > 0)].reset_index(drop=True)
     if out.empty:
         raise ValueError("Live task has no valid BUY/SELL orders.")
-    out["submit_sequence"] = out["action"].map({"SELL": 0, "BUY": 1}).astype(int)
-    out = out.sort_values(["submit_sequence", "instrument"]).reset_index(drop=True)
-    out.insert(0, "client_order_id", [f"{execution_date.replace('-', '')}-{i:03d}" for i in range(1, len(out) + 1)])
+    out["submit_sequence"] = out.apply(
+        lambda row: 2 if row["order_role"] == "backup" else (0 if row["action"] == "SELL" else 1),
+        axis=1,
+    ).astype(int)
+    out["_backup_sort"] = pd.to_numeric(out.get("backup_rank", pd.Series(index=out.index)), errors="coerce").fillna(0)
+    out["_model_rank_sort"] = pd.to_numeric(out.get("model_rank", pd.Series(index=out.index)), errors="coerce").fillna(0)
+    out = out.sort_values(["submit_sequence", "_backup_sort", "_model_rank_sort", "instrument"]).reset_index(drop=True)
+    out = out.drop(columns=["_backup_sort", "_model_rank_sort"])
+    order_ids = []
+    primary_idx = 0
+    backup_idx = 0
+    for _, row in out.iterrows():
+        if row["order_role"] == "backup":
+            backup_idx += 1
+            order_ids.append(f"{execution_date.replace('-', '')}-B{backup_idx:02d}")
+        else:
+            primary_idx += 1
+            order_ids.append(f"{execution_date.replace('-', '')}-{primary_idx:03d}")
+    out.insert(0, "client_order_id", order_ids)
+    out["price_3pct"] = ""
+    out["price_5pct"] = ""
+    buy_mask = out["action"].eq("BUY")
+    for idx, row in out.loc[buy_mask].iterrows():
+        out.at[idx, "price_3pct"], out.at[idx, "price_5pct"] = price_thresholds(float(row["estimated_price"]))
+    out["manual_price_rule"] = out.apply(
+        lambda row: "备选补位：仅当主买入跳过时使用；同样不得超过price_5pct"
+        if row["order_role"] == "backup"
+        else (
+            "看东方财富实时盘口，限价略高于卖一价，但不得超过price_5pct；涨停/买不进/超过5%跳过"
+            if row["action"] == "BUY"
+            else "按东方财富盘口人工卖出；优先保证卖出完成"
+        ),
+        axis=1,
+    )
     out["submit_instruction"] = out["action"] + " " + out["instrument"] + " " + out["shares"].astype(str)
     return out
 
@@ -148,8 +190,10 @@ def main() -> None:
         "ticket_csv": str(ticket_csv),
         "fill_template_csv": str(fill_template_csv),
         "n_orders": int(len(orders)),
-        "buy_notional_est": float((orders.loc[orders["action"].eq("BUY"), "shares"] * orders.loc[orders["action"].eq("BUY"), "estimated_price"]).sum()),
-        "sell_notional_est": float((orders.loc[orders["action"].eq("SELL"), "shares"] * orders.loc[orders["action"].eq("SELL"), "estimated_price"]).sum()),
+        "n_primary_orders": int(orders["order_role"].eq("primary").sum()) if "order_role" in orders.columns else int(len(orders)),
+        "n_backup_orders": int(orders["order_role"].eq("backup").sum()) if "order_role" in orders.columns else 0,
+        "buy_notional_est": float((orders.loc[orders["action"].eq("BUY") & orders["order_role"].eq("primary"), "shares"] * orders.loc[orders["action"].eq("BUY") & orders["order_role"].eq("primary"), "estimated_price"]).sum()),
+        "sell_notional_est": float((orders.loc[orders["action"].eq("SELL") & orders["order_role"].eq("primary"), "shares"] * orders.loc[orders["action"].eq("SELL") & orders["order_role"].eq("primary"), "estimated_price"]).sum()),
         "live_trading_enabled": str(env.get("LIVE_TRADING_ENABLED", "0")),
         "live_order_hook": hook,
         "hook_result": None,

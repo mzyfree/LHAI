@@ -13,6 +13,13 @@ MAIN_CONFIGS = [
     "workflow_config_catboost_csi1000_long_prod2026.yaml",
 ]
 
+LABEL_MODES = {
+    "default": None,
+    # T close data -> buy at T+1 open -> sell at T+2 close.
+    # This aligns the training target with the short-hold execution path.
+    "short_hold_v2": ["Ref($close, -2) / Ref($open, -1) - 1"],
+}
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate weekly production training configs.")
@@ -24,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--valid-end", required=True)
     parser.add_argument("--infer-date", required=True)
     parser.add_argument("--backtest-start", default=None)
+    parser.add_argument("--label-mode", choices=sorted(LABEL_MODES), default="default")
     return parser.parse_args()
 
 
@@ -35,6 +43,9 @@ def patch_config(config: dict, args: argparse.Namespace) -> dict:
     handler_kwargs["end_time"] = args.infer_date
     handler_kwargs["fit_start_time"] = original_start
     handler_kwargs["fit_end_time"] = args.train_end
+    label = LABEL_MODES[args.label_mode]
+    if label is not None:
+        handler_kwargs["label"] = label
 
     segments = config["task"]["dataset"]["kwargs"]["segments"]
     segments["train"] = [original_start, args.train_end]

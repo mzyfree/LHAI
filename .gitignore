@@ -41,6 +41,11 @@ local_trade_ops/live_tasks*/
 local_trade_ops/live_submissions*/
 local_trade_ops/live_fills*/
 local_trade_ops/daily_snapshots*/
+local_trade_ops/logs/
+local_trade_ops/short_hold_daily_snapshots/
+local_trade_ops/short_hold_fills/
+local_trade_ops/short_hold_submissions/
+local_trade_ops/short_hold_tasks/
 local_trade_ops/test_backups/
 
 paper_trading_system/data/

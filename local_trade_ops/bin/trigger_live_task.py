@@ -56,13 +56,18 @@ def normalize_orders(orders: pd.DataFrame) -> pd.DataFrame:
     missing = [col for col in required if col not in orders.columns]
     if missing:
         raise ValueError(f"Approved orders missing columns: {missing}")
-    out = orders.loc[:, required].copy()
+    optional = ["order_role", "model_rank", "score", "backup_rank"]
+    cols = required + [col for col in optional if col in orders.columns]
+    out = orders.loc[:, cols].copy()
+    if "order_role" not in out.columns:
+        out["order_role"] = "primary"
+    out["order_role"] = out["order_role"].fillna("primary").astype(str)
     out["instrument"] = out["instrument"].astype(str)
     out["action"] = out["action"].astype(str).str.upper()
     out["shares"] = out["shares"].astype(int)
     out["estimated_price"] = out["estimated_price"].astype(float)
     out = out[out["action"].isin(["BUY", "SELL"]) & (out["shares"] > 0)].reset_index(drop=True)
-    out["order_type"] = "MARKET_ON_OPEN"
+    out["order_type"] = out["order_role"].map({"backup": "BACKUP_MANUAL"}).fillna("MARKET_ON_OPEN")
     out["generated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     return out
 
@@ -101,8 +106,10 @@ def main() -> None:
         "approved_orders": str(approved_path),
         "task_csv": str(task_csv),
         "n_orders": int(len(orders)),
-        "buy_notional_est": float((orders.loc[orders["action"].eq("BUY"), "shares"] * orders.loc[orders["action"].eq("BUY"), "estimated_price"]).sum()),
-        "sell_notional_est": float((orders.loc[orders["action"].eq("SELL"), "shares"] * orders.loc[orders["action"].eq("SELL"), "estimated_price"]).sum()),
+        "n_primary_orders": int(orders["order_role"].eq("primary").sum()),
+        "n_backup_orders": int(orders["order_role"].eq("backup").sum()),
+        "buy_notional_est": float((orders.loc[orders["action"].eq("BUY") & orders["order_role"].eq("primary"), "shares"] * orders.loc[orders["action"].eq("BUY") & orders["order_role"].eq("primary"), "estimated_price"]).sum()),
+        "sell_notional_est": float((orders.loc[orders["action"].eq("SELL") & orders["order_role"].eq("primary"), "shares"] * orders.loc[orders["action"].eq("SELL") & orders["order_role"].eq("primary"), "estimated_price"]).sum()),
         "live_trading_enabled": str(env.get("LIVE_TRADING_ENABLED", "0")),
         "live_order_hook": str(env.get("LIVE_ORDER_HOOK", "")),
     }

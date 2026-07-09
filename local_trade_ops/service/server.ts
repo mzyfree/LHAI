@@ -48,7 +48,11 @@ function readCsv(path: string): Record<string, string>[] {
 
 function readJson(path: string | null): unknown {
   if (!path || !existsSync(path)) return null;
-  return JSON.parse(readFileSync(path, "utf8"));
+  const text = readFileSync(path, "utf8")
+    .replace(/:\s*NaN(?=\s*[,}])/g, ": null")
+    .replace(/:\s*Infinity(?=\s*[,}])/g, ": null")
+    .replace(/:\s*-Infinity(?=\s*[,}])/g, ": null");
+  return JSON.parse(text);
 }
 
 function csvEscape(value: unknown): string {
@@ -286,15 +290,117 @@ function loadStatus() {
   };
 }
 
+function loadShortHoldStatus() {
+  const env = parseEnv(ENV_PATH);
+  const stateDir = env.SHORT_HOLD_STATE_DIR || resolve(OPS_HOME, "state", "short_hold_single_peak");
+  const reportDir = env.SHORT_HOLD_REPORT_DIR || resolve(OPS_HOME, "reports", "short_hold_single_peak");
+  const taskDir = env.SHORT_HOLD_TASK_DIR || resolve(OPS_HOME, "short_hold_tasks");
+  const submissionDir = env.SHORT_HOLD_SUBMISSION_DIR || resolve(OPS_HOME, "short_hold_submissions");
+  const fillDir = env.SHORT_HOLD_FILL_DIR || resolve(OPS_HOME, "short_hold_fills");
+  const snapshotDir = env.SHORT_HOLD_SNAPSHOT_DIR || resolve(OPS_HOME, "short_hold_daily_snapshots");
+  const qlibDir = env.QLIB_PROVIDER_URI || resolve(PAPER_HOME, "data", "current");
+  const navRows = readCsv(resolve(stateDir, "paper_nav.csv"));
+  const positions = readCsv(resolve(stateDir, "paper_positions.csv"));
+  const latestPending = latestFile(stateDir, "pending_orders_");
+  const latestApproved = latestFile(stateDir, "approved_orders_");
+  const latestTask = latestFile(taskDir, "short_hold_order_task_", ".csv");
+  const latestBrokerTicket = latestFile(submissionDir, "short_hold_broker_ticket_", ".csv");
+  const latestFillTemplate = latestFile(fillDir, "short_hold_fill_template_", ".csv");
+  const latestAppliedFills = latestFile(fillDir, "short_hold_fills_applied_", ".csv");
+  const latestCandidateReview = latestFile(stateDir, "short_hold_candidate_review_", ".csv");
+  const latestModelTopReview = latestFile(stateDir, "short_hold_model_top_review_", ".csv");
+  const latestSignalRankings = latestFile(stateDir, "signal_rankings_", ".csv");
+  const latestReport = latestFile(reportDir, "short_hold_fill_");
+  const latestSnapshot = latestFile(snapshotDir, "short_hold_snapshot_", ".json");
+  const predPaths = [env.PRED_A, env.PRED_B, env.PRED_C].filter(Boolean);
+  const calendarTail = tail(resolve(qlibDir, "calendars", "day.txt"), 8);
+  const todayLocal = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).format(new Date());
+  const defaultExecutionDate =
+    dateFromFile(latestPending, "pending_orders_", ".csv") ||
+    dateFromFile(latestApproved, "approved_orders_", ".csv") ||
+    todayLocal;
+
+  return {
+    now: new Date().toISOString(),
+    env: {
+      qlibDir,
+      stateDir,
+      reportDir,
+      taskDir,
+      submissionDir,
+      fillDir,
+      snapshotDir,
+      capital: env.SHORT_HOLD_CAPITAL || env.CAPITAL || "100000",
+      topk: env.SHORT_HOLD_TOPK || "4",
+      backupCount: env.SHORT_HOLD_BACKUP_COUNT || "3",
+      excludeRestrictedMarkets: env.SHORT_HOLD_EXCLUDE_RESTRICTED_MARKETS || "1",
+      minAmount: env.SHORT_HOLD_MIN_AMOUNT || "30000000",
+      maxPositionPct: env.SHORT_HOLD_MAX_POSITION_PCT || "0.70",
+      buyBudgetMode: env.SHORT_HOLD_BUY_BUDGET_MODE || env.BUY_BUDGET_MODE || "capital_pool",
+      reserveCashPct: env.SHORT_HOLD_RESERVE_CASH_PCT || "0.02",
+      scoreTemperature: env.SHORT_HOLD_SCORE_TEMPERATURE || "1.0",
+    },
+    data: {
+      currentLink: fileInfo(qlibDir),
+      calendarTail,
+      lastCalendarDate: calendarTail.at(-1) || null,
+      todayLocal,
+    },
+    predictions: predPaths.map((p) => fileInfo(p)),
+    account: {
+      latestNav: navRows.at(-1) || null,
+      positions,
+    },
+    workflow: {
+      latestPending,
+      latestApproved,
+      latestTask,
+      latestBrokerTicket,
+      latestFillTemplate,
+      latestAppliedFills,
+      latestCandidateReview,
+      latestModelTopReview,
+      latestSignalRankings,
+      latestReport,
+      latestSnapshot,
+      latestSnapshotData: readJson(latestSnapshot),
+      defaultExecutionDate,
+      pendingOrders: latestPending ? readCsv(latestPending) : [],
+      approvedOrders: latestApproved ? readCsv(latestApproved) : [],
+      brokerTicketOrders: latestBrokerTicket
+        ? shortHoldTicketRows(readCsv(latestBrokerTicket), readCsv(latestSignalRankings || ""))
+        : [],
+      fillTemplateRows: latestFillTemplate ? shortHoldFillRows(readCsv(latestFillTemplate)) : [],
+      appliedFillRows: latestAppliedFills ? readCsv(latestAppliedFills) : [],
+      modelTopReviewRows: latestModelTopReview ? shortHoldModelTopReviewRows(readCsv(latestModelTopReview)) : [],
+      candidateReviewRows: latestCandidateReview ? readCsv(latestCandidateReview) : [],
+      recentFilteredTopRows: shortHoldRecentFilteredTopRows(stateDir),
+    },
+    jobs: [...jobs.values()].slice(-20).reverse(),
+  };
+}
+
 function addGapThresholds(rows: Record<string, string>[]): Record<string, string>[] {
   return rows.map((row) => {
     const price = Number(row.estimated_price || row.price || row.limit_price || "");
-    if (row.action !== "BUY" || !Number.isFinite(price) || price <= 0) return row;
+    if (row.action !== "BUY" || !Number.isFinite(price) || price <= 0) {
+      return {
+        ...row,
+        price_3pct: row.price_3pct || "",
+        price_5pct: row.price_5pct || "",
+        manual_price_rule: row.manual_price_rule || "卖出单无买入溢价红线，按盘口人工卖出",
+      };
+    }
     return {
       ...row,
-      price_3pct: (price * 1.03).toFixed(2),
-      price_5pct: (price * 1.05).toFixed(2),
-      limit_price_instruction: "限价=略高于卖一价且<=price_5pct",
+      price_3pct: row.price_3pct || (price * 1.03).toFixed(2),
+      price_5pct: row.price_5pct || (price * 1.05).toFixed(2),
+      manual_price_rule: row.manual_price_rule || "限价=略高于卖一价且<=price_5pct",
       rule: "涨停/高开>5%跳过",
     };
   });
@@ -302,6 +408,9 @@ function addGapThresholds(rows: Record<string, string>[]): Record<string, string
 
 function manualTicketRows(rows: Record<string, string>[]): Record<string, string>[] {
   return addGapThresholds(rows).map((row) => ({
+    role: row.order_role || "primary",
+    model_rank: row.model_rank || "",
+    score: row.score ? Number(row.score).toFixed(6) : "",
     signal_date: row.signal_date,
     execution_date: row.execution_date,
     code: row.instrument,
@@ -310,7 +419,112 @@ function manualTicketRows(rows: Record<string, string>[]): Record<string, string
     ref_price: Number(row.estimated_price || "").toFixed(2),
     price_3pct: row.price_3pct,
     price_5pct: row.price_5pct,
-    note: "超过5%/涨停/买不进则跳过",
+    manual_price_rule: row.manual_price_rule,
+    note: row.order_role === "backup"
+      ? "备选补位：主买入跳过时才看"
+      : (row.action === "BUY" ? "超过5%/涨停/买不进则跳过" : "卖出优先完成"),
+  }));
+}
+
+function scoreByInstrument(rows: Record<string, string>[]): Map<string, string> {
+  return new Map(rows.map((row) => [row.instrument || row.code || "", row.score || ""]));
+}
+
+function finiteNumber(value: unknown): number | null {
+  const n = Number(value ?? "");
+  return Number.isFinite(n) ? n : null;
+}
+
+function formatNumber(value: unknown, digits: number): string {
+  const n = finiteNumber(value);
+  return n === null ? "" : n.toFixed(digits);
+}
+
+function shortHoldRecentFilteredTopRows(stateDir: string, limit = 5): Record<string, string>[] {
+  const files = listFiles(stateDir, "short_hold_candidate_review_")
+    .filter((name) => name.endsWith(".csv"))
+    .reverse();
+  const bySignalDate = new Map<string, Record<string, string>>();
+
+  for (const name of files) {
+    const rows = readCsv(resolve(stateDir, name))
+      .filter((row) => ["ORDERED", "BACKUP"].includes(row.status))
+      .filter((row) => finiteNumber(row.planned_shares) !== null && Number(row.planned_shares) > 0)
+      .sort((a, b) => {
+        const rankA = finiteNumber(a.model_rank) ?? Number.POSITIVE_INFINITY;
+        const rankB = finiteNumber(b.model_rank) ?? Number.POSITIVE_INFINITY;
+        if (rankA !== rankB) return rankA - rankB;
+        return (finiteNumber(b.score) ?? Number.NEGATIVE_INFINITY) - (finiteNumber(a.score) ?? Number.NEGATIVE_INFINITY);
+      });
+    const top = rows[0];
+    if (!top || !top.signal_date || bySignalDate.has(top.signal_date)) continue;
+
+    const price = finiteNumber(top.estimated_price);
+    bySignalDate.set(top.signal_date, {
+      signal_date: top.signal_date,
+      execution_date: top.execution_date || "",
+      exit_date: top.exit_date || "",
+      code: top.instrument || "",
+      role: top.order_role || "",
+      model_rank: top.model_rank || "",
+      score: formatNumber(top.score, 6),
+      ref_price: formatNumber(top.estimated_price, 2),
+      price_5pct: price === null ? "" : (price * 1.05).toFixed(2),
+      shares: top.planned_shares || "",
+      planned_value: formatNumber(top.planned_value, 0),
+      status: top.status || "",
+    });
+    if (bySignalDate.size >= limit) break;
+  }
+
+  return [...bySignalDate.values()];
+}
+
+function shortHoldTicketRows(
+  rows: Record<string, string>[],
+  latestSignalRows: Record<string, string>[] = [],
+): Record<string, string>[] {
+  const latestSignalScore = scoreByInstrument(latestSignalRows);
+  return addGapThresholds(rows).map((row) => ({
+    role: row.order_role || "primary",
+    signal_date: row.signal_date,
+    execution_date: row.execution_date,
+    exit_date: row.exit_date,
+    code: row.instrument,
+    action: row.action,
+    shares: row.shares,
+    ref_price: Number(row.estimated_price || "").toFixed(2),
+    price_3pct: row.action === "BUY" ? row.price_3pct : "",
+    price_5pct: row.action === "BUY" ? row.price_5pct : "",
+    model_rank: row.model_rank || "",
+    entry_score: row.action === "SELL" && row.score ? Number(row.score).toFixed(6) : "",
+    signal_score: (latestSignalScore.get(row.instrument) || (row.action === "BUY" ? row.score : ""))
+      ? Number(latestSignalScore.get(row.instrument) || row.score).toFixed(6)
+      : "",
+    alloc_weight: row.softmax_weight ? (Number(row.softmax_weight) * 100).toFixed(2) + "%" : "",
+    target_value: row.target_value ? Number(row.target_value).toFixed(0) : "",
+    planned_value: row.planned_value ? Number(row.planned_value).toFixed(0) : "",
+    note: row.order_role === "backup"
+      ? "backup 组合：primary 买不进时使用"
+      : row.action === "SELL"
+      ? "到期卖出；entry_score为入仓分数，signal_score为最新模型分数"
+      : "primary 主单：按日期节奏执行",
+  }));
+}
+
+function shortHoldFillRows(rows: Record<string, string>[]): Record<string, string>[] {
+  return addGapThresholds(rows);
+}
+
+function shortHoldModelTopReviewRows(rows: Record<string, string>[]): Record<string, string>[] {
+  return rows.map((row) => ({
+    model_rank: row.model_rank || "",
+    code: row.instrument || "",
+    score: row.score ? Number(row.score).toFixed(6) : "",
+    close: row.close ? Number(row.close).toFixed(2) : "",
+    amount20: row.amount20 ? (Number(row.amount20) / 10000).toFixed(0) + "万" : "",
+    filter_status: row.filter_status || "",
+    filter_reason: row.filter_reason || "",
   }));
 }
 
@@ -434,7 +648,7 @@ function html() {
 <body>
   <header>
     <h1>Local Trade Ops</h1>
-    <p class="muted">数据更新、信号生成、人工 review、实盘任务触发、收益展示。</p>
+    <p class="muted">数据更新、信号生成、人工 review、实盘任务触发、收益展示。<a href="/short-hold" style="color:#8a4f18;font-weight:800;">进入单峰短持有页面</a></p>
   </header>
   <main>
     <section>
@@ -459,10 +673,14 @@ function html() {
             <b>09:30 前不下单；09:30-09:35 打开东方财富 App 人工逐只买。</b><br>
             程序只给候选股票和 <code>price_5pct</code> 红线；具体挂多少由你看盘口决定，但不超过红线。成交后只回填东方财富「当日成交」里的真实股数和均价。
           </div>
+          <div class="time-note">
+            <b>A股交易时间：</b>09:15-09:25 开盘集合竞价；09:30-11:30 上午连续竞价；13:00-14:57 下午连续竞价；14:57-15:00 收盘集合竞价。<br>
+            <b>我们的窗口：</b>09:25 只观察开盘价和涨跌幅；09:30-09:35 人工买入；尾盘/收盘前处理需要卖出的单子。
+          </div>
           <div class="pill-row">
             <span class="pill">≤3%：舒适区，可正常看盘口买</span>
             <span class="pill warn">3%-5%：偏高但允许，人来判断</span>
-            <span class="pill stop">&gt;5%：跳过，不追，不补位</span>
+            <span class="pill stop">&gt;5%：主单跳过，可顺延看备选</span>
           </div>
         </div>
       </div>
@@ -500,8 +718,9 @@ function html() {
     }
     function fillEditor(rows) {
       if (!rows || !rows.length) return '<p class="muted">暂无回填模板。先生成手工下单清单。</p>';
-      return '<table><thead><tr><th>代码</th><th>方向</th><th>委托股数</th><th>参考价</th><th>成交股数</th><th>成交价</th><th>备注</th></tr></thead><tbody>' +
+      return '<table><thead><tr><th>角色</th><th>代码</th><th>方向</th><th>委托股数</th><th>参考价</th><th>成交股数</th><th>成交价</th><th>备注</th></tr></thead><tbody>' +
         rows.map((r, i) => '<tr>' +
+          '<td>' + escapeHtml(r.order_role || 'primary') + '</td>' +
           '<td>' + escapeHtml(r.instrument) + '</td>' +
           '<td>' + escapeHtml(r.action) + '</td>' +
           '<td>' + escapeHtml(r.shares) + '</td>' +
@@ -538,13 +757,16 @@ function html() {
       const account = snapshot.account || {};
       const orders = snapshot.orders || {};
       const positions = snapshot.positions || [];
-      const skipped = (orders.skipped || []).map(row => ({
+      const operations = (orders.operations || []).map(row => ({
         code: row.code,
         action: row.action,
-        planned_shares: row.planned_shares,
-        filled_shares: row.filled_shares,
+        planned: row.planned_shares,
+        filled: row.filled_shares,
+        ref_price: row.ref_price,
+        price_5pct: row.price_5pct,
+        fill_price: row.fill_price,
         status: row.status,
-        reason: row.note || '未填写原因',
+        note: row.note || '',
       }));
       const fmtPct = v => (v === null || v === undefined || v === '') ? '-' : (Number(v).toFixed(2) + '%');
       el.innerHTML =
@@ -559,7 +781,7 @@ function html() {
           '<div><b>已成交</b><br>' + escapeHtml(orders.filled_count ?? 0) + ' / 计划 ' + escapeHtml(orders.planned_count ?? 0) + '</div>' +
           '<div><b>跳过/未成交</b><br>' + escapeHtml(orders.skipped_count ?? 0) + '</div>' +
         '</div>' +
-        '<h3>跳过/未成交明细</h3>' + table(skipped) +
+        '<h3>当日操作</h3>' + table(operations) +
         '<h3>持仓快照</h3>' + table(positions);
     }
     function hasFillDraft() {
@@ -570,7 +792,7 @@ function html() {
     }
     function renderOrders(s) {
       document.querySelector('#orders').innerHTML =
-        '<h3>手工下单清单</h3><p class="muted">signal_date 是信号日期，表示用这天收盘后的数据/预测生成清单；execution_date 是人工下单执行日。estimated_price 是昨晚参考价；price_3pct 是舒适区提示；price_5pct 是最高买入红线。超过 price_5pct、涨停、买不进就跳过，不补位。</p>' + table(s.workflow.brokerTicketOrders) +
+        '<h3>手工下单清单</h3><p class="muted">signal_date 是信号日期，表示用这天收盘后的数据/预测生成清单；execution_date 是人工下单执行日。estimated_price 是昨晚参考价；price_3pct 是舒适区提示；price_5pct 是最高买入红线。主单超过 price_5pct、涨停、买不进就跳过；role=backup 是备选补位，优先参考 model_rank/score 和盘口，由你决定是否补位。</p>' + table(s.workflow.brokerTicketOrders) +
         '<h3>成交回填</h3><p class="muted">填东方财富「当日成交」里的实际成交股数和成交均价。没成交/跳过/撤单填 0 或留空，并在备注写原因。</p>' + fillEditor(s.workflow.fillTemplateRows) +
         '<div class="submit-row"><button id="submit-fills" onclick="run(\\'apply-manual-fills\\')" class="secondary">提交成交回填</button></div>' +
         '<p class="muted">最新实盘任务: ' + (s.workflow.latestTask || '-') +
@@ -656,6 +878,238 @@ function html() {
 </html>`;
 }
 
+function shortHoldHtml() {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Short Hold Ops</title>
+  <style>
+    :root { color-scheme: light; --ink:#1d241f; --muted:#68736b; --line:#d9dfd7; --bg:#f5f0e4; --card:#fffdf6; --accent:#8a4f18; --green:#0e7c66; }
+    body { margin:0; font-family: ui-serif, Georgia, "Times New Roman", serif; background: radial-gradient(circle at 18% 0%, #f7d9a7, transparent 26rem), var(--bg); color:var(--ink); }
+    header { padding: 28px 34px 12px; }
+    h1 { margin:0; font-size:32px; letter-spacing:-0.03em; }
+    main { padding: 0 34px 34px; display:grid; grid-template-columns: 1fr 1fr; gap:18px; }
+    section { background: color-mix(in srgb, var(--card) 93%, white); border:1px solid var(--line); border-radius:18px; padding:18px; box-shadow: 0 14px 40px #0000000d; }
+    .span-all { grid-column:1 / -1; }
+    h2 { margin:0 0 12px; font-size:18px; }
+    h3 { margin:12px 0 8px; font-size:16px; }
+    button { border:0; border-radius:999px; background:var(--green); color:white; padding:10px 14px; margin:4px; cursor:pointer; font-weight:800; }
+    button.secondary { background:#30453f; }
+    button.warn { background:var(--accent); }
+    .cards { display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:14px; }
+    .card { border-left:5px solid var(--accent); background:#fff7e8; border-radius:16px; padding:14px; }
+    .card p { line-height:1.55; margin:0 0 10px; }
+    .rule { padding:12px; border:1px solid #ebd2a9; border-radius:14px; background:#fff9ec; line-height:1.6; margin-top:12px; }
+    .risk { padding:12px; border:1px solid #e8b4a4; border-radius:14px; background:#fff0eb; line-height:1.6; margin-top:12px; }
+    .metric-row { display:grid; grid-template-columns: repeat(4, minmax(0,1fr)); gap:8px; margin-top:10px; }
+    .metric { border:1px solid #ead6b4; border-radius:12px; background:#fffdf8; padding:9px 10px; }
+    .metric b { display:block; font-size:12px; color:#79521e; }
+    .metric span { font-weight:900; font-size:17px; }
+    .pill { display:inline-flex; border-radius:999px; padding:5px 8px; margin:4px 4px 0 0; background:#f7ead4; color:#683a0e; font-weight:800; font-size:12px; }
+    .job-card { margin-top:12px; padding:10px 12px; border-radius:12px; background:#17231f; color:#ecf7ed; font-size:13px; }
+    .job-card.failed { background:#4a1f16; }
+    .job-card.success { background:#173f34; }
+    .job-log { margin:8px 0 0; max-height:130px; overflow:auto; white-space:pre-wrap; color:#fff7e0; }
+    .grid { display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:12px; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    td, th { border-bottom:1px solid var(--line); padding:7px; text-align:left; }
+    input { padding:7px 9px; border-radius:10px; border:1px solid var(--line); width:90px; }
+    pre { white-space:pre-wrap; background:#17231f; color:#ecf7ed; padding:14px; border-radius:12px; max-height:320px; overflow:auto; }
+    .muted { color:var(--muted); }
+    .submit-row { display:flex; justify-content:flex-end; margin:14px 0 4px; }
+    nav a { color:#6b3c12; font-weight:800; }
+    @media (max-width: 900px) { main { grid-template-columns:1fr; padding:0 18px 24px; } header { padding:22px 18px 10px; } .cards { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Short Hold Ops</h1>
+    <p class="muted">单峰短持有策略：T 信号，T+1 人工买入，T+2 尾盘/收盘卖出。<nav><a href="/">返回原 T/T+1 页面</a></nav></p>
+  </header>
+  <main>
+    <section>
+      <h2>操作台</h2>
+      <div class="cards">
+        <div class="card">
+          <h3>1. 生成短持有清单</h3>
+          <p class="muted">复用原来的数据更新和 PKL 推理，然后生成短持有专用 BUY/SELL 清单。SELL 是到期持仓，BUY 是新一轮信号。</p>
+          <button onclick="run('prepare-short-hold-orders')">生成短持有清单</button>
+        </div>
+        <div class="card">
+          <h3>2. 回填成交 / 日报</h3>
+          <p class="muted">人工按东方财富成交回填。买入会记录 exit_date；到期卖出完成后释放现金。</p>
+          <button onclick="run('generate-and-send-short-hold-snapshot')" class="warn">生成并推送短持有日报</button>
+        </div>
+      </div>
+      <div class="rule">
+        <b>执行纪律</b><br>
+        买入：T+1 09:30-09:35 按清单人工判断，仍遵守不追涨停、不超过 price_5pct。<br>
+        卖出：T+2 尾盘/收盘前按到期 SELL 清单优先完成。<br>
+        A股交易时间：09:15-09:25 开盘集合竞价；09:30-11:30 上午连续竞价；13:00-14:57 下午连续竞价；14:57-15:00 收盘集合竞价。<br>
+        操作节奏：09:25 只观察；09:30-09:35 买入；14:57 前后开始检查到期 SELL，15:00 前完成能成交的卖出。<br>
+        当前默认初始资金池：<b>10W</b>；生成手工清单时默认按整体资金池做 BUY 预算，不受模拟账本剩余现金影响；如需实盘口径，可设置 SHORT_HOLD_BUY_BUDGET_MODE=available_cash。默认参数：top4、min_amount=3000万、max_position_pct=70%、softmax 分配。
+        <div><span class="pill">独立账本</span><span class="pill">独立回填</span><span class="pill">独立日报</span></div>
+      </div>
+      <div id="jobSummary" class="job-card">等待操作...</div>
+    </section>
+    <section>
+      <h2>账户 / 状态</h2>
+      <div id="account"></div>
+    </section>
+    <section class="span-all">
+      <h2>日报快照</h2>
+      <div id="snapshot"></div>
+    </section>
+    <section class="span-all">
+      <h2>短持有订单</h2>
+      <div id="orders"></div>
+    </section>
+    <section class="span-all">
+      <h2>任务日志</h2>
+      <pre id="jobs">loading...</pre>
+    </section>
+  </main>
+  <script>
+    async function api(path, body) {
+      const res = await fetch(path, body ? {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)} : {});
+      if (!res.ok) throw new Error(await res.text());
+      return res.json();
+    }
+    function escapeHtml(text) {
+      return String(text ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+    }
+    function table(rows) {
+      if (!rows || !rows.length) return '<p class="muted">暂无</p>';
+      const cols = Object.keys(rows[0]);
+      return '<table><thead><tr>' + cols.map(c => '<th>'+escapeHtml(c)+'</th>').join('') + '</tr></thead><tbody>' +
+        rows.map(r => '<tr>' + cols.map(c => '<td>'+escapeHtml(r[c] ?? '')+'</td>').join('') + '</tr>').join('') + '</tbody></table>';
+    }
+    function fillEditor(rows) {
+      if (!rows || !rows.length) return '<p class="muted">暂无回填模板。先生成短持有清单。</p>';
+      return '<table><thead><tr><th>角色</th><th>代码</th><th>方向</th><th>执行日</th><th>退出日</th><th>委托股数</th><th>参考价</th><th>成交股数</th><th>成交价</th><th>备注</th></tr></thead><tbody>' +
+        rows.map((r, i) => '<tr>' +
+          '<td>' + escapeHtml(r.order_role || 'primary') + '</td>' +
+          '<td>' + escapeHtml(r.instrument) + '</td>' +
+          '<td>' + escapeHtml(r.action) + '</td>' +
+          '<td>' + escapeHtml(r.execution_date) + '</td>' +
+          '<td>' + escapeHtml(r.exit_date || '') + '</td>' +
+          '<td>' + escapeHtml(r.shares) + '</td>' +
+          '<td>' + escapeHtml(r.estimated_price) + '</td>' +
+          '<td><input data-fill-row="' + i + '" data-fill-field="fill_shares" value="' + escapeHtml(r.fill_shares || '') + '" placeholder="股数"></td>' +
+          '<td><input data-fill-row="' + i + '" data-fill-field="fill_price" value="' + escapeHtml(r.fill_price || '') + '" placeholder="价格"></td>' +
+          '<td><input data-fill-row="' + i + '" data-fill-field="operator_note" value="' + escapeHtml(r.operator_note || '') + '" placeholder="可选"></td>' +
+        '</tr>').join('') + '</tbody></table>';
+    }
+    function jobSummary(job) {
+      const el = document.querySelector('#jobSummary');
+      if (!job) { el.className = 'job-card'; el.textContent = '等待操作...'; return; }
+      el.className = 'job-card ' + job.status;
+      const log = (job.log || '').trim().split('\\n').slice(-8).join('\\n');
+      el.innerHTML = '<b>最近任务</b>: ' + escapeHtml(job.name) + ' ｜ ' + escapeHtml(job.status) + ' ｜ ' + escapeHtml(job.startedAt) +
+        (log ? '<div class="job-log">' + escapeHtml(log) + '</div>' : '');
+    }
+    function hasFillDraft() {
+      return Array.from(document.querySelectorAll('[data-fill-row]')).some(input => input.value.trim() !== '');
+    }
+    function isEditingFill() {
+      return Boolean(document.activeElement && document.activeElement.dataset && document.activeElement.dataset.fillRow);
+    }
+    function budgetModeLabel(mode) {
+      if (mode === 'available_cash') return '当前剩余现金';
+      if (mode === 'reserve_nav' || mode === 'available_cash_reserved') return '当前现金-NAV预留';
+      if (mode === 'capital_pool_reserved') return '整体资金池-预留';
+      return '整体资金池';
+    }
+    function renderSnapshot(snapshot) {
+      if (!snapshot) {
+        document.querySelector('#snapshot').innerHTML = '<p class="muted">暂无短持有日报。回填后点击“生成并推送短持有日报”。</p>';
+        return;
+      }
+      const account = snapshot.account || {};
+      document.querySelector('#snapshot').innerHTML =
+        '<p class="muted">生成时间：' + escapeHtml(snapshot.generated_at || '-') + ' ｜ 日期：' + escapeHtml(snapshot.date || '-') + '</p>' +
+        '<div class="grid">' +
+        '<div><b>NAV</b><br>' + escapeHtml(account.nav ?? '-') + '</div>' +
+        '<div><b>现金</b><br>' + escapeHtml(account.cash ?? '-') + '</div>' +
+        '<div><b>仓位</b><br>' + escapeHtml(Number(account.position_ratio_pct || 0).toFixed(2)) + '%</div>' +
+        '<div><b>累计收益</b><br>' + escapeHtml(Number(account.cum_return_pct || 0).toFixed(2)) + '%</div>' +
+        '<div><b>本日盈亏</b><br>' + escapeHtml(account.daily_pnl ?? '-') + '</div>' +
+        '<div><b>本日收益</b><br>' + escapeHtml(Number(account.daily_return_pct || 0).toFixed(2)) + '%</div>' +
+        '</div><h3>当日操作</h3>' + table(snapshot.orders?.operations || []) +
+        '<h3>当前持仓</h3>' + table(snapshot.positions || []);
+    }
+    function renderOrders(s) {
+      const rows = s.workflow.brokerTicketOrders || [];
+      const firstBuy = rows.find(r => r.action === 'BUY');
+      const timeline = firstBuy
+        ? (firstBuy.signal_date + ' 信号；' + firstBuy.execution_date + ' 开盘人工买；' + firstBuy.exit_date + ' 尾盘/收盘卖')
+        : '生成清单后会显示具体 signal / execution / exit 日期';
+      document.querySelector('#orders').innerHTML =
+        '<h3>近5个信号日 Filter 后 Top1</h3><p class="muted">来源：短持有 candidate review，排除 FILTERED/SKIPPED，只看已经通过过滤并可进入主单或 backup 的 BUY 候选。</p>' + table(s.workflow.recentFilteredTopRows) +
+        '<h3>模型 Top5 / 过滤检查</h3><p class="muted">score 是模型原始分；FILTERED 表示不会进入主单/备选池。</p>' + table(s.workflow.modelTopReviewRows) +
+        '<h3>手工下单清单</h3><p class="muted"><b>本轮节奏：</b>' + escapeHtml(timeline) + '。role=primary 是主单；role=backup 是 primary 因涨停/高开/买不进/未成交时使用的组合补位，按释放主单资金重新 softmax 分配。entry_score 是已有持仓当初买入时的入仓分数，没有入仓则为空；signal_score 是最新信号日模型跑出的当天原始分。BUY 的 price_5pct 是最高买入红线；SELL 是到期持仓，优先卖出。</p>' + table(rows) +
+        '<h3>成交回填</h3><p class="muted">填东方财富「当日成交」里的真实成交股数/均价；没成交填 0 或留空并备注。</p>' + fillEditor(s.workflow.fillTemplateRows) +
+        '<div class="submit-row"><button onclick="run(\\'short-hold-apply-fills\\')" class="secondary">提交短持有回填</button></div>' +
+        '<p class="muted">最新任务: ' + (s.workflow.latestTask || '-') +
+        '<br>最新清单: ' + (s.workflow.latestBrokerTicket || '-') +
+        '<br>最新回填模板: ' + (s.workflow.latestFillTemplate || '-') +
+        '<br>最新已应用成交: ' + (s.workflow.latestAppliedFills || '-') + '</p>';
+    }
+    async function refresh(options = {}) {
+      const s = await api('/api/short-hold/status');
+      jobSummary(s.jobs?.[0]);
+      document.querySelector('#account').innerHTML =
+        '<div class="grid">' +
+        '<div><b>NAV</b><br>' + (s.account.latestNav?.nav ?? '-') + '</div>' +
+        '<div><b>现金</b><br>' + (s.account.latestNav?.cash ?? '-') + '</div>' +
+        '<div><b>持仓市值</b><br>' + (s.account.latestNav?.position_value ?? '-') + '</div>' +
+        '<div><b>成本</b><br>' + (s.account.latestNav?.trade_cost ?? '-') + '</div>' +
+        '</div><h3>状态</h3>' +
+        '<p><b>本地最新交易日</b>: ' + (s.data.lastCalendarDate || '-') + ' ｜ 今天=' + s.data.todayLocal + '</p>' +
+        '<p><b>今日短持有清单</b>: ' + (s.workflow.brokerTicketOrders?.length ? '已生成 ' + s.workflow.brokerTicketOrders.length + ' 条' : '暂无') + '</p>' +
+        '<p><b>初始资金池</b>: ' + Number(s.env.capital || 100000).toLocaleString('zh-CN') + ' ｜ <b>BUY预算</b>: ' + budgetModeLabel(s.env.buyBudgetMode) + ' ｜ <b>策略</b>: top' + s.env.topk + ' + backup' + s.env.backupCount + ', maxPositionPct=' + s.env.maxPositionPct + ', minAmount=' + s.env.minAmount + ', temperature=' + s.env.scoreTemperature + ', 排除创业板/科创板=' + s.env.excludeRestrictedMarkets + '</p>' +
+        '<p><b>数据日历</b>: ' + s.data.calendarTail.join(', ') + '</p>' +
+        '<h3>持仓</h3>' + table(s.account.positions);
+      if (options.forceOrders || (!isEditingFill() && !hasFillDraft())) renderOrders(s);
+      renderSnapshot(s.workflow.latestSnapshotData);
+      document.querySelector('#jobs').textContent = s.jobs.map(j => '['+j.status+'] '+j.name+' '+j.startedAt+'\\n'+j.log).join('\\n\\n') || '暂无任务';
+      document.querySelector('#jobs').scrollTop = document.querySelector('#jobs').scrollHeight;
+    }
+    async function run(action) {
+      try {
+        const status = await api('/api/short-hold/status');
+        const executionDate = status.workflow.defaultExecutionDate || status.data.todayLocal;
+        document.querySelector('#jobSummary').textContent = '已触发 ' + action + '，正在执行...';
+        if (action === 'short-hold-apply-fills') {
+          const rows = (status.workflow.fillTemplateRows || []).map((row, i) => {
+            const next = {...row};
+            document.querySelectorAll('[data-fill-row="' + i + '"]').forEach(input => {
+              next[input.dataset.fillField] = input.value.trim();
+            });
+            return next;
+          });
+          if (!rows.length) return alert('暂无短持有回填模板，请先生成短持有清单');
+          const hasFill = rows.some(row => Number(row.fill_shares || 0) > 0 && Number(row.fill_price || 0) > 0);
+          if (!hasFill) return alert('还没有填写任何实际成交。');
+          await api('/api/short-hold/save-fills', {executionDate, rows});
+        }
+        await api('/api/short-hold/run/' + action, {executionDate});
+        setTimeout(() => refresh({forceOrders: true}), 1200);
+      } catch (err) {
+        const message = err && err.message ? err.message : String(err);
+        document.querySelector('#jobSummary').textContent = '操作失败：' + message;
+        alert('操作失败：' + message);
+      }
+    }
+    refresh();
+    setInterval(refresh, 30 * 60 * 1000);
+  </script>
+</body>
+</html>`;
+}
+
 function send(res: import("node:http").ServerResponse, status: number, body: unknown, type = "application/json") {
   res.writeHead(status, { "content-type": `${type}; charset=utf-8` });
   res.end(type === "application/json" ? JSON.stringify(body, null, 2) : String(body));
@@ -665,7 +1119,9 @@ const server = createServer(async (req, res) => {
   try {
     const url = new URL(req.url || "/", "http://localhost");
     if (req.method === "GET" && url.pathname === "/") return send(res, 200, html(), "text/html");
+    if (req.method === "GET" && url.pathname === "/short-hold") return send(res, 200, shortHoldHtml(), "text/html");
     if (req.method === "GET" && url.pathname === "/api/status") return send(res, 200, loadStatus());
+    if (req.method === "GET" && url.pathname === "/api/short-hold/status") return send(res, 200, loadShortHoldStatus());
     if (req.method === "POST" && url.pathname === "/api/save-fills") {
       const body = await parseJsonBody(req);
       const executionDate = validateDate(body.executionDate);
@@ -677,6 +1133,29 @@ const server = createServer(async (req, res) => {
       if (!rows.length) throw new Error("rows is required");
       writeCsv(fillPath, rows);
       return send(res, 200, { path: fillPath, nRows: rows.length });
+    }
+    if (req.method === "POST" && url.pathname === "/api/short-hold/save-fills") {
+      const body = await parseJsonBody(req);
+      const executionDate = validateDate(body.executionDate);
+      const env = parseEnv(ENV_PATH);
+      const fillDir = env.SHORT_HOLD_FILL_DIR || resolve(OPS_HOME, "short_hold_fills");
+      mkdirSync(fillDir, { recursive: true });
+      const fillPath = resolve(fillDir, `short_hold_fill_template_${executionDate}.csv`);
+      const rows = Array.isArray(body.rows) ? body.rows : [];
+      if (!rows.length) throw new Error("rows is required");
+      writeCsv(fillPath, rows);
+      return send(res, 200, { path: fillPath, nRows: rows.length });
+    }
+    if (req.method === "POST" && url.pathname.startsWith("/api/short-hold/run/")) {
+      const action = url.pathname.split("/").pop() || "";
+      const body = await parseJsonBody(req);
+      let job: Job;
+      if (action === "prepare-short-hold-orders") job = startJob(action, OPS_HOME, "bash", ["bin/prepare_short_hold_orders.sh"]);
+      else if (action === "short-hold-apply-fills") job = startJob(action, OPS_HOME, "bash", ["bin/short_hold_apply_fills.sh", validateDate(body.executionDate)]);
+      else if (action === "short-hold-daily-snapshot") job = startJob(action, OPS_HOME, "bash", ["bin/short_hold_daily_snapshot.sh", validateDate(body.executionDate)]);
+      else if (action === "generate-and-send-short-hold-snapshot") job = startJob(action, OPS_HOME, "bash", ["bin/generate_and_send_short_hold_snapshot.sh", validateDate(body.executionDate)]);
+      else return send(res, 404, { error: `unknown short-hold action: ${action}` });
+      return send(res, 200, job);
     }
     if (req.method === "POST" && url.pathname.startsWith("/api/run/")) {
       const action = url.pathname.split("/").pop() || "";

@@ -39,6 +39,14 @@ ONE_LOT_FLAG="--no-allow-one-lot-over-target"
 if [ "${ALLOW_ONE_LOT_OVER_TARGET:-1}" = "1" ] || [ "${ALLOW_ONE_LOT_OVER_TARGET:-1}" = "true" ]; then
   ONE_LOT_FLAG="--allow-one-lot-over-target"
 fi
+FILTER_ST_FLAG="--filter-st"
+if [ "${FILTER_ST:-1}" = "0" ] || [ "${FILTER_ST:-1}" = "false" ]; then
+  FILTER_ST_FLAG="--no-filter-st"
+fi
+FILTER_PAUSED_FLAG="--filter-paused"
+if [ "${FILTER_PAUSED:-1}" = "0" ] || [ "${FILTER_PAUSED:-1}" = "false" ]; then
+  FILTER_PAUSED_FLAG="--no-filter-paused"
+fi
 
 "${PYTHON_BIN}" "${PAPER_ENGINE_HOME}/src/paper_trading_daily.py" after-close \
   --provider-uri "${QLIB_PROVIDER_URI}" \
@@ -52,12 +60,16 @@ fi
   --topk "${TOPK}" \
   --n-drop "${N_DROP}" \
   --buy-scan-topk "${BUY_SCAN_TOPK:-150}" \
+  --backup-buy-count "${BACKUP_BUY_COUNT:-3}" \
   --lot-size "${LOT_SIZE}" \
   --reserve-cash-pct "${RESERVE_CASH_PCT}" \
+  --buy-budget-mode "${BUY_BUDGET_MODE:-capital_pool}" \
   --max-position-pct "${MAX_POSITION_PCT}" \
   --filter-mode "${FILTER_MODE}" \
   --min-price "${MIN_PRICE}" \
   --max-price "${MAX_PRICE}" \
   --min-amount "${MIN_AMOUNT}" \
   --lookback "${LOOKBACK}" \
+  "${FILTER_ST_FLAG}" \
+  "${FILTER_PAUSED_FLAG}" \
   "${ONE_LOT_FLAG}"

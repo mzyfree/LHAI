@@ -234,6 +234,49 @@ def safe_price(row: pd.Series, inst: str) -> float:
     return price if math.isfinite(price) and price > 0 else 0.0
 
 
+def truthy_market_flag(value: object) -> bool:
+    if value is None or pd.isna(value):
+        return False
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "t", "yes", "y", "st", "*st"}
+    try:
+        return bool(float(value) != 0.0)
+    except (TypeError, ValueError):
+        return bool(value)
+
+
+def load_security_flags(provider_uri: str, instruments: set[str], date: pd.Timestamp) -> pd.DataFrame:
+    """Load optional risk flags from Qlib without making them hard dependencies."""
+    from qlib.data import D
+
+    instruments_l = sorted(instruments)
+    if not instruments_l:
+        return pd.DataFrame(columns=["instrument", "is_st", "paused"])
+    init_qlib(provider_uri)
+    frames: list[pd.DataFrame] = []
+    for field, name in [("$is_st", "is_st"), ("$paused", "paused")]:
+        try:
+            data = D.features(instruments_l, [field], start_time=date, end_time=date, freq="day")
+        except Exception as exc:
+            print(f"warning: optional Qlib flag {field} unavailable: {exc}", file=sys.stderr)
+            continue
+        if data is None or data.empty:
+            continue
+        part = data.rename(columns={field: name}).reset_index()
+        part[name] = part[name].map(truthy_market_flag)
+        frames.append(part.loc[:, ["instrument", name]])
+    if not frames:
+        return pd.DataFrame(columns=["instrument", "is_st", "paused"])
+    out = frames[0]
+    for frame in frames[1:]:
+        out = out.merge(frame, on="instrument", how="outer")
+    for col in ["is_st", "paused"]:
+        if col not in out.columns:
+            out[col] = False
+        out[col] = out[col].fillna(False).astype(bool)
+    return out.loc[:, ["instrument", "is_st", "paused"]]
+
+
 def apply_jq_filter(
     signal: pd.DataFrame,
     close_row: pd.Series,
@@ -241,13 +284,25 @@ def apply_jq_filter(
     min_price: float,
     max_price: float,
     min_amount: float,
+    security_flags: pd.DataFrame | None = None,
+    filter_st: bool = True,
+    filter_paused: bool = True,
 ) -> pd.DataFrame:
     avg_amount = amount_window.mean(axis=0, skipna=True) if not amount_window.empty else pd.Series(dtype=float)
+    flag_map = security_flags.set_index("instrument").to_dict("index") if security_flags is not None and not security_flags.empty else {}
     keep = []
     for inst in signal["instrument"].astype(str):
         price = safe_price(close_row, inst)
         amt = float(avg_amount.get(inst, 0.0) or 0.0)
-        keep.append(min_price <= price <= max_price and amt >= min_amount)
+        flags = flag_map.get(inst, {})
+        is_flagged_st = bool(flags.get("is_st", False))
+        is_paused = bool(flags.get("paused", False))
+        keep.append(
+            min_price <= price <= max_price
+            and amt >= min_amount
+            and not (filter_st and is_flagged_st)
+            and not (filter_paused and is_paused)
+        )
     filtered = signal.loc[keep].reset_index(drop=True)
     filtered["rank"] = filtered.index + 1
     return filtered
@@ -318,18 +373,49 @@ def build_orders(args: argparse.Namespace, account: dict, positions: pd.DataFram
         if signal_date in close_px.index:
             close_row = close_px.loc[signal_date]
             amount_window = amount.loc[:signal_date].tail(args.lookback)
-            signal = apply_jq_filter(signal, close_row, amount_window, args.min_price, args.max_price, args.min_amount)
+            security_flags = load_security_flags(args.provider_uri, instruments, signal_date)
+            signal = apply_jq_filter(
+                signal,
+                close_row,
+                amount_window,
+                args.min_price,
+                args.max_price,
+                args.min_amount,
+                security_flags,
+                args.filter_st,
+                args.filter_paused,
+            )
     prices = load_raw_prices(args.provider_uri, instruments, signal_date, "close")
     price_map = prices.set_index("instrument")["price"].to_dict()
+    rank_map = signal.set_index("instrument")["rank"].to_dict()
+    score_map = signal.set_index("instrument")["score"].to_dict()
     current, sell_list = select_topk_dropout(signal, positions, args.topk, args.n_drop)
     pos_map = positions.set_index("instrument")["shares"].to_dict() if not positions.empty else {}
     marked_value = sum(int(shares) * float(price_map.get(inst, 0.0)) for inst, shares in pos_map.items())
-    equity = float(account["cash"]) + marked_value
+    cash = float(account["cash"])
+    nav = cash + marked_value
+    buy_budget_mode = args.buy_budget_mode.lower()
+    if buy_budget_mode in {"capital_pool", "capital", "total_capital"}:
+        equity = float(args.capital)
+        buy_budget = max(float(args.capital), 0.0)
+    elif buy_budget_mode in {"capital_pool_reserved", "capital_reserved"}:
+        equity = float(args.capital)
+        buy_budget = max(float(args.capital) * (1.0 - args.reserve_cash_pct), 0.0)
+    elif buy_budget_mode in {"reserve_nav", "available_cash_reserved"}:
+        equity = nav
+        buy_budget = max(cash - nav * args.reserve_cash_pct, 0.0)
+    elif buy_budget_mode == "available_cash":
+        equity = nav
+        buy_budget = max(cash, 0.0)
+    else:
+        raise ValueError(
+            "buy_budget_mode must be one of capital_pool, capital_pool_reserved, "
+            "available_cash, available_cash_reserved"
+        )
     target_value = min(equity * (1.0 - args.reserve_cash_pct) / args.topk, equity * args.max_position_pct)
     kept = [inst for inst in current if inst not in set(sell_list)]
-    available_cash = float(account["cash"])
     sell_value = sum(int(pos_map.get(inst, 0)) * float(price_map.get(inst, 0.0)) for inst in sell_list)
-    available_cash += sell_value
+    available_cash = buy_budget + sell_value
     buy_slots = max(args.topk - len(kept), 0)
     if current and sell_list:
         buy_slots = min(buy_slots, args.n_drop)
@@ -353,11 +439,11 @@ def build_orders(args: argparse.Namespace, account: dict, positions: pd.DataFram
             args.allow_one_lot_over_target,
         )
         if shares <= 0:
-            skipped_rows.append([signal_date.date(), execution_date.date(), inst, "SKIP", 0, price, reason])
+            skipped_rows.append([signal_date.date(), execution_date.date(), inst, "SKIP", 0, price, reason, "primary", rank_map.get(inst, ""), score_map.get(inst, ""), ""])
             continue
         planned_value = shares * price
         if planned_value + reserved_buy_value > available_cash:
-            skipped_rows.append([signal_date.date(), execution_date.date(), inst, "SKIP", 0, price, "insufficient_cash"])
+            skipped_rows.append([signal_date.date(), execution_date.date(), inst, "SKIP", 0, price, "insufficient_cash", "primary", rank_map.get(inst, ""), score_map.get(inst, ""), ""])
             continue
         buy_list.append(inst)
         reserved_buy_value += planned_value
@@ -366,7 +452,7 @@ def build_orders(args: argparse.Namespace, account: dict, positions: pd.DataFram
     for inst in sell_list:
         shares = int(pos_map.get(inst, 0))
         if shares > 0:
-            rows.append([signal_date.date(), execution_date.date(), inst, "SELL", shares, price_map.get(inst, 0.0), "dropout"])
+            rows.append([signal_date.date(), execution_date.date(), inst, "SELL", shares, price_map.get(inst, 0.0), "dropout", "primary", rank_map.get(inst, ""), score_map.get(inst, ""), ""])
     for inst in buy_list:
         price = float(price_map.get(inst, 0.0))
         shares, reason = planned_buy_shares(
@@ -378,10 +464,50 @@ def build_orders(args: argparse.Namespace, account: dict, positions: pd.DataFram
             args.allow_one_lot_over_target,
         )
         action = "BUY" if shares > 0 else "SKIP"
-        rows.append([signal_date.date(), execution_date.date(), inst, action, shares, price, reason])
+        rows.append([signal_date.date(), execution_date.date(), inst, action, shares, price, reason, "primary", rank_map.get(inst, ""), score_map.get(inst, ""), ""])
+
+    backup_count = max(int(getattr(args, "backup_buy_count", 0)), 0)
+    backup_excluded = set(excluded) | set(buy_list)
+    backup_rows = []
+    for inst in ranked_candidates:
+        if len(backup_rows) >= backup_count:
+            break
+        if inst in backup_excluded:
+            continue
+        price = float(price_map.get(inst, 0.0))
+        shares, reason = planned_buy_shares(
+            target_value,
+            equity,
+            price,
+            args.lot_size,
+            args.max_position_pct,
+            args.allow_one_lot_over_target,
+        )
+        if shares <= 0:
+            continue
+        backup_rows.append([signal_date.date(), execution_date.date(), inst, "BUY", shares, price, "backup_rank", "backup", rank_map.get(inst, ""), score_map.get(inst, ""), len(backup_rows) + 1])
+        backup_excluded.add(inst)
+
+    rows.extend(backup_rows)
     rows.extend(skipped_rows)
 
-    orders = pd.DataFrame(rows, columns=["signal_date", "execution_date", "instrument", "action", "shares", "estimated_price", "reason"])
+    orders = pd.DataFrame(
+        rows,
+        columns=[
+            "signal_date",
+            "execution_date",
+            "instrument",
+            "action",
+            "shares",
+            "estimated_price",
+            "reason",
+            "order_role",
+            "model_rank",
+            "score",
+            "backup_rank",
+        ],
+    )
+    primary = orders["order_role"].eq("primary") if not orders.empty else pd.Series(dtype=bool)
     summary = {
         "signal_date": str(signal_date.date()),
         "execution_date": str(execution_date.date()),
@@ -392,8 +518,9 @@ def build_orders(args: argparse.Namespace, account: dict, positions: pd.DataFram
         "marked_equity": float(equity),
         "n_current": int(len(pos_map)),
         "n_targets": int(len(kept) + len(buy_list)),
-        "n_buy": int((orders["action"] == "BUY").sum()) if not orders.empty else 0,
-        "n_sell": int((orders["action"] == "SELL").sum()) if not orders.empty else 0,
+        "n_buy": int((orders["action"].eq("BUY") & primary).sum()) if not orders.empty else 0,
+        "n_sell": int((orders["action"].eq("SELL") & primary).sum()) if not orders.empty else 0,
+        "n_backup_buy": int((orders["action"].eq("BUY") & orders["order_role"].eq("backup")).sum()) if not orders.empty else 0,
         "buy_scan_topk": int(buy_scan_topk),
     }
     return orders, signal, summary
@@ -414,6 +541,7 @@ def write_plan_report(report_dir: Path, summary: dict, orders: pd.DataFrame, sig
 - Current holdings: `{summary["n_current"]}`
 - Buy orders: `{summary["n_buy"]}`
 - Sell orders: `{summary["n_sell"]}`
+- Backup buy candidates: `{summary.get("n_backup_buy", 0)}`
 
 ## Orders
 
@@ -583,8 +711,14 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--topk", type=int, default=20)
         p.add_argument("--n-drop", type=int, default=2)
         p.add_argument("--buy-scan-topk", type=int, default=150)
+        p.add_argument("--backup-buy-count", type=int, default=0)
         p.add_argument("--lot-size", type=int, default=100)
         p.add_argument("--reserve-cash-pct", type=float, default=0.02)
+        p.add_argument(
+            "--buy-budget-mode",
+            default="capital_pool",
+            choices=["capital_pool", "capital_pool_reserved", "available_cash", "available_cash_reserved", "reserve_nav"],
+        )
         p.add_argument("--max-position-pct", type=float, default=0.12)
         p.add_argument("--allow-one-lot-over-target", action=argparse.BooleanOptionalAction, default=True)
         p.add_argument("--filter-mode", choices=["raw", "jq_filter"], default="raw")
@@ -592,6 +726,8 @@ def build_parser() -> argparse.ArgumentParser:
         p.add_argument("--max-price", type=float, default=80.0)
         p.add_argument("--min-amount", type=float, default=2e7)
         p.add_argument("--lookback", type=int, default=20)
+        p.add_argument("--filter-st", action=argparse.BooleanOptionalAction, default=True)
+        p.add_argument("--filter-paused", action=argparse.BooleanOptionalAction, default=True)
 
     p = sub.add_parser("after-close")
     add_common(p)

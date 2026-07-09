@@ -23,6 +23,14 @@ ONE_LOT_FLAG="--no-allow-one-lot-over-target"
 if [ "${ALLOW_ONE_LOT_OVER_TARGET:-1}" = "1" ] || [ "${ALLOW_ONE_LOT_OVER_TARGET:-1}" = "true" ]; then
   ONE_LOT_FLAG="--allow-one-lot-over-target"
 fi
+FILTER_ST_FLAG="--filter-st"
+if [ "${FILTER_ST:-1}" = "0" ] || [ "${FILTER_ST:-1}" = "false" ]; then
+  FILTER_ST_FLAG="--no-filter-st"
+fi
+FILTER_PAUSED_FLAG="--filter-paused"
+if [ "${FILTER_PAUSED:-1}" = "0" ] || [ "${FILTER_PAUSED:-1}" = "false" ]; then
+  FILTER_PAUSED_FLAG="--no-filter-paused"
+fi
 
 if [ -n "${FUSED_PRED:-}" ] && [ -f "${FUSED_PRED}" ]; then
   "${PYTHON_BIN}" "${PAPER_HOME}/src/paper_trading_daily.py" after-close \
@@ -36,12 +44,15 @@ if [ -n "${FUSED_PRED:-}" ] && [ -f "${FUSED_PRED}" ]; then
     --buy-scan-topk "${BUY_SCAN_TOPK:-150}" \
     --lot-size "${LOT_SIZE}" \
     --reserve-cash-pct "${RESERVE_CASH_PCT}" \
+    --buy-budget-mode "${BUY_BUDGET_MODE:-capital_pool}" \
     --max-position-pct "${MAX_POSITION_PCT}" \
     --filter-mode "${FILTER_MODE:-jq_filter}" \
     --min-price "${MIN_PRICE:-5}" \
     --max-price "${MAX_PRICE:-80}" \
     --min-amount "${MIN_AMOUNT:-20000000}" \
     --lookback "${LOOKBACK:-20}" \
+    "${FILTER_ST_FLAG}" \
+    "${FILTER_PAUSED_FLAG}" \
     "${ONE_LOT_FLAG}"
 else
   "${PYTHON_BIN}" "${PAPER_HOME}/src/paper_trading_daily.py" after-close \
@@ -58,11 +69,14 @@ else
     --buy-scan-topk "${BUY_SCAN_TOPK:-150}" \
     --lot-size "${LOT_SIZE}" \
     --reserve-cash-pct "${RESERVE_CASH_PCT}" \
+    --buy-budget-mode "${BUY_BUDGET_MODE:-capital_pool}" \
     --max-position-pct "${MAX_POSITION_PCT}" \
     --filter-mode "${FILTER_MODE:-jq_filter}" \
     --min-price "${MIN_PRICE:-5}" \
     --max-price "${MAX_PRICE:-80}" \
     --min-amount "${MIN_AMOUNT:-20000000}" \
     --lookback "${LOOKBACK:-20}" \
+    "${FILTER_ST_FLAG}" \
+    "${FILTER_PAUSED_FLAG}" \
     "${ONE_LOT_FLAG}"
 fi

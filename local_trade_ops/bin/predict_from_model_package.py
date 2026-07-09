@@ -23,6 +23,8 @@ DEFAULT_MODELS = {
     "catboost_csi1000_long_prod2026": "catboost_csi1000_long_prod2026.pkl",
 }
 
+PACKAGE_ROOT_PREFIXES = ("csi1000_main_", "csi1000_short_hold_v2_")
+
 
 def latest_calendar_date(provider_uri: Path) -> str:
     calendar_path = provider_uri / "calendars" / "day.txt"
@@ -43,7 +45,7 @@ def ensure_extracted(package_path: Path, extract_dir: Path) -> Path:
         package_roots = sorted({
             Path(member.name).parts[0]
             for member in tar.getmembers()
-            if Path(member.name).parts and Path(member.name).parts[0].startswith("csi1000_main_")
+            if Path(member.name).parts and Path(member.name).parts[0].startswith(PACKAGE_ROOT_PREFIXES)
         })
         for root in reversed(package_roots):
             candidate = extract_dir / root
@@ -53,7 +55,8 @@ def ensure_extracted(package_path: Path, extract_dir: Path) -> Path:
 
     candidates = [extract_dir / root for root in package_roots if (extract_dir / root).is_dir()]
     if not candidates:
-        raise SystemExit(f"No csi1000_main_* directory found after extracting: {package_path}")
+        prefixes = ", ".join(f"{prefix}*" for prefix in PACKAGE_ROOT_PREFIXES)
+        raise SystemExit(f"No supported package root ({prefixes}) found after extracting: {package_path}")
     return sorted(candidates)[-1]
 
 

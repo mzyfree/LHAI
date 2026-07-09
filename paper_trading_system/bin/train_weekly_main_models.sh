@@ -4,7 +4,7 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  bash bin/train_weekly_main_models.sh RUN_ID PROVIDER_URI TRAIN_END VALID_START VALID_END INFER_DATE
+  bash bin/train_weekly_main_models.sh RUN_ID PROVIDER_URI TRAIN_END VALID_START VALID_END INFER_DATE [LABEL_MODE] [MODEL_FLAVOR]
 
 Example:
   bash bin/train_weekly_main_models.sh 20260531_20260529 \
@@ -24,6 +24,8 @@ TRAIN_END="$3"
 VALID_START="$4"
 VALID_END="$5"
 INFER_DATE="$6"
+LABEL_MODE="${7:-default}"
+MODEL_FLAVOR="${8:-main}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PAPER_HOME="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -37,8 +39,9 @@ RUN_ROOT="${RUN_ROOT:-/root/autodl-tmp/llhh/weekly_train/${RUN_ID}}"
 CONFIG_DIR="${RUN_ROOT}/configs"
 LOG_DIR="${RUN_ROOT}/logs"
 PRED_DIR="${RUN_ROOT}/preds/csi1000"
-PACKAGE_ROOT="${RUN_ROOT}/model_package/csi1000_main_${RUN_ID}"
-PACKAGE_PATH="${RUN_ROOT}/csi1000_main_model_packages_${RUN_ID}.tar.gz"
+PACKAGE_ROOT_NAME="csi1000_${MODEL_FLAVOR}_${RUN_ID}"
+PACKAGE_ROOT="${RUN_ROOT}/model_package/${PACKAGE_ROOT_NAME}"
+PACKAGE_PATH="${RUN_ROOT}/csi1000_${MODEL_FLAVOR}_model_packages_${RUN_ID}.tar.gz"
 
 export PYTHONPATH="${QLIB_SRC}:${PAPER_HOME}/src:${PYTHONPATH:-}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/mpl}"
@@ -61,6 +64,8 @@ echo "PROVIDER_URI=${PROVIDER_URI}"
 echo "TRAIN_END=${TRAIN_END}"
 echo "VALID=${VALID_START} -> ${VALID_END}"
 echo "INFER_DATE=${INFER_DATE}"
+echo "LABEL_MODE=${LABEL_MODE}"
+echo "MODEL_FLAVOR=${MODEL_FLAVOR}"
 echo "RUN_ROOT=${RUN_ROOT}"
 echo
 
@@ -71,7 +76,8 @@ echo
   --train-end "${TRAIN_END}" \
   --valid-start "${VALID_START}" \
   --valid-end "${VALID_END}" \
-  --infer-date "${INFER_DATE}"
+  --infer-date "${INFER_DATE}" \
+  --label-mode "${LABEL_MODE}"
 
 snapshot_runs() {
   "${PYTHON_BIN}" - "${MLRUNS_DIR}" <<'PY'
@@ -155,7 +161,7 @@ train_one "xgb_csi1000_long_prod2026"
 train_one "doubleensemble_csi1000_short_prod2026"
 train_one "catboost_csi1000_long_prod2026"
 
-tar -czf "${PACKAGE_PATH}" -C "${RUN_ROOT}/model_package" "csi1000_main_${RUN_ID}"
+tar -czf "${PACKAGE_PATH}" -C "${RUN_ROOT}/model_package" "${PACKAGE_ROOT_NAME}"
 
 echo
 echo "===== weekly training package ready ====="
