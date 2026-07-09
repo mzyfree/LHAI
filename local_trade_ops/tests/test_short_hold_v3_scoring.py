@@ -2,6 +2,7 @@ from pathlib import Path
 import sys
 import unittest
 
+import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -78,6 +79,12 @@ class ShortHoldV3ScoringTests(unittest.TestCase):
         self.assertEqual(list(constant), [0.0, 0.0])
         self.assertTrue(empty.empty)
 
+    def test_normalize_series_keeps_invalid_values_below_valid_value(self):
+        normalized = _normalize_series(pd.Series([5.0, np.nan, np.inf, "bad"]))
+
+        valid_score = float(normalized.iloc[0])
+        self.assertTrue(all(float(score) < valid_score for score in normalized.iloc[1:]))
+
     def test_liquidity_risk_clips_to_expected_range(self):
         risk = _liquidity_risk(pd.Series([0, 25_000_000, 50_000_000, 100_000_000]))
 
@@ -109,6 +116,90 @@ class ShortHoldV3ScoringTests(unittest.TestCase):
         sorted_candidates = sort_candidates_for_orders(candidates)
 
         self.assertEqual(list(sorted_candidates["instrument"]), ["B", "C", "A"])
+
+    def test_sort_candidates_for_orders_sorts_numeric_strings_and_invalid_last(self):
+        candidates = pd.DataFrame(
+            {
+                "instrument": ["A", "B", "C", "D"],
+                "score": ["2", "10", "bad", np.inf],
+            }
+        )
+
+        sorted_candidates = sort_candidates_for_orders(candidates)
+
+        self.assertEqual(list(sorted_candidates["instrument"]), ["B", "A", "C", "D"])
+
+    def test_sort_candidates_for_orders_is_stable_for_tied_scores(self):
+        candidates = pd.DataFrame(
+            {
+                "instrument": ["A", "B", "C", "D"],
+                "final_score": ["1.0", 0.5, "1.0", 0.5],
+            }
+        )
+
+        sorted_candidates = sort_candidates_for_orders(candidates)
+
+        self.assertEqual(list(sorted_candidates["instrument"]), ["A", "C", "B", "D"])
+
+    def test_score_candidates_keeps_invalid_return_scores_below_valid_scores(self):
+        candidates = pd.DataFrame(
+            {
+                "instrument": ["VALID", "NAN", "INF", "BAD"],
+                "return_score": [5.0, np.nan, np.inf, "bad"],
+                "amount": [50_000_000] * 4,
+            }
+        )
+
+        scored = score_candidates_v3(
+            candidates,
+            pd.DataFrame(),
+            alpha=0.0,
+            beta=0.0,
+            gamma=0.0,
+        )
+        score_by_instrument = scored.set_index("instrument")["final_score"]
+
+        self.assertTrue(
+            all(
+                float(score_by_instrument.loc[instrument]) < float(score_by_instrument.loc["VALID"])
+                for instrument in ["NAN", "INF", "BAD"]
+            )
+        )
+
+    def test_score_candidates_aggregates_duplicate_side_scores_by_max(self):
+        candidates = pd.DataFrame(
+            {
+                "instrument": ["A", "B"],
+                "return_score": [1.0, 2.0],
+                "amount": [50_000_000, 50_000_000],
+            }
+        )
+        side_scores = pd.DataFrame(
+            {
+                "instrument": ["A", "B", "A"],
+                "buyability_risk": [0.2, 0.4, 0.9],
+                "strong_prob": [0.8, 0.3, 0.1],
+            }
+        )
+
+        scored = score_candidates_v3(candidates, side_scores)
+        by_instrument = scored.set_index("instrument")
+
+        self.assertEqual(float(by_instrument.loc["A", "buyability_risk"]), 0.9)
+        self.assertEqual(float(by_instrument.loc["A", "strong_prob"]), 0.8)
+        self.assertEqual(float(by_instrument.loc["B", "buyability_risk"]), 0.4)
+        self.assertEqual(float(by_instrument.loc["B", "strong_prob"]), 0.3)
+
+    def test_score_candidates_rejects_duplicate_candidate_instruments(self):
+        candidates = pd.DataFrame(
+            {
+                "instrument": ["A", "A"],
+                "return_score": [1.0, 2.0],
+            }
+        )
+
+        with self.assertRaisesRegex(ValueError, "duplicate instrument"):
+            score_candidates_v3(candidates, pd.DataFrame())
 
 
 if __name__ == "__main__":

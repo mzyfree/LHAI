@@ -31,11 +31,23 @@ def _normalize_series(values: object) -> pd.Series:
     if series.empty:
         return pd.Series(dtype="float64", index=series.index)
 
-    std = series.std()
-    if pd.isna(std) or std == 0:
+    valid_mask = series.notna()
+    valid = series[valid_mask]
+    if valid.empty:
         return pd.Series(0.0, index=series.index, dtype="float64")
 
-    return ((series - series.mean()) / std).fillna(0.0).astype(float)
+    normalized = pd.Series(np.nan, index=series.index, dtype="float64")
+    std = valid.std()
+    if pd.isna(std) or std == 0:
+        normalized.loc[valid_mask] = 0.0
+    else:
+        normalized.loc[valid_mask] = ((valid - valid.mean()) / std).astype(float)
+
+    if valid_mask.all():
+        return normalized.astype(float)
+
+    normalized.loc[~valid_mask] = float(normalized.loc[valid_mask].min()) - 1.0
+    return normalized.astype(float)
 
 
 def _liquidity_risk(amount: object) -> pd.Series:
@@ -82,6 +94,15 @@ def _candidate_frame(candidates: object) -> pd.DataFrame:
             raise ValueError("candidates must include return_score or score column")
     else:
         frame["return_score"] = _numeric_series(frame["return_score"], index=frame.index)
+
+    duplicate_instruments = frame.loc[
+        frame["instrument"].duplicated(),
+        "instrument",
+    ].unique()
+    if len(duplicate_instruments) > 0:
+        duplicate_list = ", ".join(map(str, duplicate_instruments[:5]))
+        raise ValueError(f"candidates contain duplicate instrument values: {duplicate_list}")
+
     return frame.reset_index(drop=True)
 
 
@@ -92,7 +113,11 @@ def _side_score_frame(side_scores: object) -> pd.DataFrame:
             frame[column] = 0.0
         frame[column] = _numeric_series(frame[column], index=frame.index).fillna(0.0).clip(lower=0.0, upper=1.0)
 
-    return frame[["instrument", *SIDE_SCORE_COLUMNS]].drop_duplicates(subset=["instrument"], keep="first")
+    return (
+        frame[["instrument", *SIDE_SCORE_COLUMNS]]
+        .groupby("instrument", as_index=False, sort=True)
+        .max()
+    )
 
 
 def score_candidates_v3(
