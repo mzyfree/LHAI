@@ -1,0 +1,58 @@
+{
+  "strategy_id": "auction_top1_forward_20260908",
+  "status": "frozen_forward_observation",
+  "frozen_at": "2026-09-08",
+  "research_data_end": "2026-09-07",
+  "forward_observation_start": "2026-09-08",
+  "initial_capital": 100000,
+  "pool_count": 1,
+  "topk": 1,
+  "allow_preemption": false,
+  "leader_weights": {
+    "open_strength": 0.2,
+    "prior_5d_strength": 0.3,
+    "naked_k_structure": 0.45,
+    "limit_memory_60d": 0.05
+  },
+  "entry": {
+    "hot_sector_count": 1,
+    "min_market_open_breadth": 0.2,
+    "min_stock_sector_open_edge": 0.0,
+    "max_entry_gap": 0.05,
+    "max_prior_return_20d": 0.25,
+    "min_amount_ma20": 30000000,
+    "min_price": 3.0,
+    "min_pattern_count": 0,
+    "min_prior_limit_count_60d": 1
+  },
+  "exit": {
+    "daily_drop_threshold": -0.03,
+    "signal_low_buffer": 0.0,
+    "fixed_stop_loss": null,
+    "close_below_prior_ma5": true,
+    "max_holding_days": 5,
+    "cooldown_after_loss_days": 0
+  },
+  "costs": {
+    "buy_rate": 0.0003,
+    "sell_rate": 0.0008,
+    "minimum_fee": 5.0,
+    "lot_size": 100
+  },
+  "in_sample_reference": {
+    "period": "2026-01-05/2026-09-07",
+    "cum_return": 2.624924,
+    "max_drawdown": -0.112515,
+    "completed_trades": 26,
+    "win_rate": 0.5769,
+    "median_trade_return": 0.0168,
+    "twenty_bps_each_side_cum_return": 2.284541,
+    "twenty_bps_each_side_max_drawdown": -0.11562
+  },
+  "evaluation_policy": {
+    "parameters_must_not_change": true,
+    "append_only_after": "2026-09-07",
+    "compare_with_original_single_pool_baseline": true,
+    "notes": "Any parameter change creates a new strategy_id and must not overwrite this record."
+  }
+}

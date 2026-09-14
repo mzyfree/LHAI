@@ -3,6 +3,16 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { URL } from "node:url";
+import { loadNakedKStatus, nakedKHtml, recordNakedKFill } from "./naked-k.ts";
+import { loadNakedKModelStatus, nakedKModelHtml, saveNakedKModelDecision } from "./naked-k-model.ts";
+import {
+  ignoreNakedKLiveDecision,
+  loadNakedKLiveStatus,
+  nakedKLiveHtml,
+  recordNakedKLiveDecision,
+  recordNakedKLiveFill,
+  recordNakedKLiveOpen,
+} from "./naked-k-live.ts";
 
 type Env = Record<string, string>;
 type Job = {
@@ -20,8 +30,36 @@ const PROJECT_HOME = resolve(OPS_HOME, "..");
 const PAPER_HOME = resolve(PROJECT_HOME, "paper_trading_system");
 const ENV_PATH = resolve(OPS_HOME, "config", "env.local");
 const SCHEDULER_CONFIG_PATH = resolve(OPS_HOME, "config", "scheduler.json");
+const RECOMMENDATION_TRACKER_DIR = resolve(OPS_HOME, "recommendation_tracker");
+const RECOMMENDATION_STORE_PATH = resolve(RECOMMENDATION_TRACKER_DIR, "recommendations.json");
 const jobs = new Map<string, Job>();
 let lastSchedulerCheck = "";
+
+type RecommendationRecord = {
+  id: string;
+  source: string;
+  recommendationDate: string;
+  code: string;
+  name: string;
+  focusPrice: string;
+  suggestedPosition: string;
+  targetPrice: string;
+  supportPrice: string;
+  rationale: string;
+  disclaimer: string;
+  advisor: string;
+  buyPrice: string;
+  buyLots: string;
+  buyDate: string;
+  buySavedAt?: string;
+  sellPrice: string;
+  sellLots: string;
+  sellDate: string;
+  sellSavedAt?: string;
+  note: string;
+  createdAt: string;
+  updatedAt: string;
+};
 
 function parseEnv(path: string): Env {
   const env: Env = {};
@@ -73,6 +111,199 @@ function writeCsv(path: string, rows: Record<string, unknown>[]) {
   writeFileSync(path, `${lines.join("\n")}\n`, "utf8");
 }
 
+function readRecommendationRecords(): RecommendationRecord[] {
+  if (!existsSync(RECOMMENDATION_STORE_PATH)) return [];
+  try {
+    const records = JSON.parse(readFileSync(RECOMMENDATION_STORE_PATH, "utf8"));
+    return Array.isArray(records) ? records as RecommendationRecord[] : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeRecommendationRecords(records: RecommendationRecord[]) {
+  mkdirSync(RECOMMENDATION_TRACKER_DIR, { recursive: true });
+  writeFileSync(RECOMMENDATION_STORE_PATH, `${JSON.stringify(records, null, 2)}\n`, "utf8");
+}
+
+function cleanText(value: unknown): string {
+  return typeof value === "string" ? value.trim() : value == null ? "" : String(value).trim();
+}
+
+function optionalDate(value: unknown, field: string): string {
+  const text = cleanText(value);
+  if (!text) return "";
+  try {
+    return validateDate(text);
+  } catch {
+    throw new Error(`${field} must be YYYY-MM-DD`);
+  }
+}
+
+function positiveNumberText(value: unknown, field: string): string {
+  const text = cleanText(value);
+  if (!text) return "";
+  const number = Number(text);
+  if (!Number.isFinite(number) || number < 0) throw new Error(`${field} must be a non-negative number`);
+  return String(number);
+}
+
+function recommendationView(record: RecommendationRecord) {
+  const buyLots = Number(record.buyLots || 0);
+  const sellLots = Number(record.sellLots || 0);
+  const buyPrice = Number(record.buyPrice || 0);
+  const sellPrice = Number(record.sellPrice || 0);
+  const boughtShares = buyLots * 100;
+  const soldShares = sellLots * 100;
+  const heldShares = Math.max(0, boughtShares - soldShares);
+  const realizedPnl = buyPrice > 0 && sellPrice > 0 && soldShares > 0
+    ? (sellPrice - buyPrice) * soldShares
+    : null;
+  const realizedReturn = buyPrice > 0 && sellPrice > 0 ? (sellPrice / buyPrice - 1) * 100 : null;
+  const status = !boughtShares
+    ? "待买入"
+    : !soldShares
+      ? "持有中"
+      : heldShares > 0
+        ? "部分卖出"
+        : "已卖出";
+  return { ...record, boughtShares, soldShares, heldShares, realizedPnl, realizedReturn, status };
+}
+
+function recommendationStatus() {
+  const records = readRecommendationRecords()
+    .map(recommendationView)
+    .sort((a, b) => `${b.recommendationDate}${b.createdAt}`.localeCompare(`${a.recommendationDate}${a.createdAt}`));
+  const today = localParts("Asia/Shanghai").date;
+  return {
+    today,
+    records,
+    stats: {
+      total: records.length,
+      todayCount: records.filter((record) => record.recommendationDate === today).length,
+      pending: records.filter((record) => record.status === "待买入").length,
+      holding: records.filter((record) => record.status === "持有中" || record.status === "部分卖出").length,
+      sold: records.filter((record) => record.status === "已卖出").length,
+    },
+  };
+}
+
+function recommendationFromBody(body: Record<string, unknown>, existing?: RecommendationRecord): RecommendationRecord {
+  const now = new Date().toISOString();
+  const record: RecommendationRecord = {
+    id: existing?.id || `rec-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    source: cleanText(body.source ?? existing?.source),
+    recommendationDate: optionalDate(body.recommendationDate ?? existing?.recommendationDate, "recommendationDate"),
+    code: cleanText(body.code ?? existing?.code).toUpperCase(),
+    name: cleanText(body.name ?? existing?.name),
+    focusPrice: cleanText(body.focusPrice ?? existing?.focusPrice),
+    suggestedPosition: cleanText(body.suggestedPosition ?? existing?.suggestedPosition),
+    targetPrice: cleanText(body.targetPrice ?? existing?.targetPrice),
+    supportPrice: cleanText(body.supportPrice ?? existing?.supportPrice),
+    rationale: cleanText(body.rationale ?? existing?.rationale),
+    disclaimer: cleanText(body.disclaimer ?? existing?.disclaimer),
+    advisor: cleanText(body.advisor ?? existing?.advisor),
+    buyPrice: positiveNumberText(body.buyPrice ?? existing?.buyPrice, "buyPrice"),
+    buyLots: positiveNumberText(body.buyLots ?? existing?.buyLots, "buyLots"),
+    buyDate: optionalDate(body.buyDate ?? existing?.buyDate, "buyDate"),
+    buySavedAt: cleanText(body.buySavedAt ?? existing?.buySavedAt),
+    sellPrice: positiveNumberText(body.sellPrice ?? existing?.sellPrice, "sellPrice"),
+    sellLots: positiveNumberText(body.sellLots ?? existing?.sellLots, "sellLots"),
+    sellDate: optionalDate(body.sellDate ?? existing?.sellDate, "sellDate"),
+    sellSavedAt: cleanText(body.sellSavedAt ?? existing?.sellSavedAt),
+    note: cleanText(body.note ?? existing?.note),
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+  };
+  if (!record.source || !record.recommendationDate || !record.code || !record.name) {
+    throw new Error("source, recommendationDate, code and name are required");
+  }
+  if (Number(record.sellLots || 0) > Number(record.buyLots || 0)) {
+    throw new Error("sellLots cannot exceed buyLots");
+  }
+  return record;
+}
+
+function normalizeRecommendationDate(value: string): string {
+  const text = value.trim().replace(/[./]/g, "-");
+  if (/^\d{1,2}-\d{1,2}$/.test(text)) {
+    const [month, day] = text.split("-").map(Number);
+    return validateDate(`${localParts("Asia/Shanghai").date.slice(0, 4)}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`);
+  }
+  return validateDate(text);
+}
+
+function fieldFromRecommendationText(text: string, labels: string[]): string {
+  for (const label of labels) {
+    const match = text.match(new RegExp(`(?:^|\\n)\\s*${label}\\s*[：:]\\s*([^\\n]+)`, "i"));
+    if (match) return match[1].trim();
+  }
+  return "";
+}
+
+function parseRecommendationText(rawText: string): RecommendationRecord[] {
+  const blocks = rawText
+    .replace(/\r/g, "")
+    .split(/(?=【[^\n】]+】\s*(?:教学案例|推荐|案例)?\s*\n?\s*入选时间[：:])/)
+    .map((block) => block.trim())
+    .filter(Boolean);
+  if (!blocks.length) throw new Error("未识别到推荐文本，请从“【服务名】… 入选时间：…”开始粘贴");
+  const now = new Date().toISOString();
+  return blocks.map((block) => {
+    const source = (block.match(/^【([^】]+)】/) || [])[1] || "第三方推荐";
+    const date = normalizeRecommendationDate(fieldFromRecommendationText(block, ["入选时间", "入选日期"]));
+    const code = fieldFromRecommendationText(block, ["股票代码", "代码"]).replace(/\s/g, "");
+    const name = fieldFromRecommendationText(block, ["股票名称", "名称"]);
+    const rationaleMatch = block.match(/入选理由\s*[：:]\s*([\s\S]*?)(?=\n\s*【风险提示】|$)/);
+    const disclaimerMatch = block.match(/【风险提示】\s*([\s\S]*)$/);
+    const advisorMatch = block.match(/投资顾问\s*[：:]?\s*([^\s]+).*?执业编号\s*[：:]?\s*([A-Z0-9]+)/);
+    const record: RecommendationRecord = {
+      id: `rec-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      source,
+      recommendationDate: date,
+      code: code.toUpperCase(),
+      name,
+      focusPrice: fieldFromRecommendationText(block, ["关注价格"]),
+      suggestedPosition: fieldFromRecommendationText(block, ["参考仓位", "建议仓位"]),
+      targetPrice: fieldFromRecommendationText(block, ["目标价格"]) || (fieldFromRecommendationText(block, ["压力价格"]) ? `压力：${fieldFromRecommendationText(block, ["压力价格"])}` : ""),
+      supportPrice: fieldFromRecommendationText(block, ["支撑价格"]),
+      rationale: rationaleMatch?.[1]?.trim() || "",
+      disclaimer: disclaimerMatch?.[1]?.trim() || "",
+      advisor: advisorMatch ? `${advisorMatch[1]} / ${advisorMatch[2]}` : "",
+      buyPrice: "", buyLots: "", buyDate: "", sellPrice: "", sellLots: "", sellDate: "", note: "",
+      createdAt: now, updatedAt: now,
+    };
+    if (!record.code || !record.name) throw new Error(`未能识别股票代码或名称：${block.slice(0, 80)}`);
+    return record;
+  });
+}
+
+function updateRecommendationFill(id: string, side: "buy" | "sell", body: Record<string, unknown>) {
+  const records = readRecommendationRecords();
+  const index = records.findIndex((record) => record.id === id);
+  if (index < 0) throw new Error("recommendation not found");
+  const existing = records[index];
+  const savedAt = new Date().toISOString();
+  const fillDate = localParts("Asia/Shanghai").date;
+  const patch = side === "buy"
+    ? {
+      buyPrice: positiveNumberText(body.buyPrice, "buyPrice"),
+      buyLots: positiveNumberText(body.buyLots, "buyLots"),
+      buyDate: fillDate,
+      buySavedAt: savedAt,
+    }
+    : {
+      sellPrice: positiveNumberText(body.sellPrice, "sellPrice"),
+      sellLots: positiveNumberText(body.sellLots, "sellLots"),
+      sellDate: fillDate,
+      sellSavedAt: savedAt,
+    };
+  const record = recommendationFromBody({ ...existing, ...patch }, existing);
+  records[index] = record;
+  writeRecommendationRecords(records);
+  return recommendationView(record);
+}
+
 function listFiles(dir: string, prefix = ""): string[] {
   if (!existsSync(dir)) return [];
   return readdirSync(dir)
@@ -83,6 +314,31 @@ function listFiles(dir: string, prefix = ""): string[] {
 function latestFile(dir: string, prefix: string, suffix = ""): string | null {
   const files = listFiles(dir, prefix).filter((name) => (suffix ? name.endsWith(suffix) : true));
   return files.length ? resolve(dir, files[files.length - 1]) : null;
+}
+
+function latestDirectoryWithFile(dir: string, fileName: string): string | null {
+  if (!existsSync(dir)) return null;
+  const candidates = readdirSync(dir, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => resolve(dir, entry.name))
+    .filter((path) => existsSync(resolve(path, fileName)))
+    .sort((a, b) => {
+      const diff = statSync(a).mtimeMs - statSync(b).mtimeMs;
+      return diff || a.localeCompare(b);
+    });
+  return candidates.length ? candidates[candidates.length - 1] : null;
+}
+
+function loadLatestShortHoldV3ResearchReport() {
+  const env = parseEnv(ENV_PATH);
+  const researchDir = env.SHORT_HOLD_V3_RESEARCH_DIR || resolve(OPS_HOME, "reports", "short_hold_v3_research");
+  const latestDir = latestDirectoryWithFile(researchDir, "research_report.md");
+  if (!latestDir) return { reportPath: "", markdown: "" };
+  const reportPath = resolve(latestDir, "research_report.md");
+  return {
+    reportPath,
+    markdown: readFileSync(reportPath, "utf8"),
+  };
 }
 
 function dateFromFile(path: string | null, prefix: string, suffix = ""): string | null {
@@ -109,6 +365,21 @@ function fileInfo(path: string) {
   };
 }
 
+function fileInfoWithPath(path: string, name?: string) {
+  return {
+    name: name || path.split("/").pop() || path,
+    path,
+    ...fileInfo(path),
+  };
+}
+
+function sideModelArtifacts(dir: string) {
+  if (!dir) return [];
+  return ["buyability_model.pkl", "strong_model.pkl", "metadata.json"].map((name) =>
+    fileInfoWithPath(resolve(dir, name), name),
+  );
+}
+
 function defaultSchedulerConfig() {
   return {
     dataUpdate: {
@@ -118,6 +389,30 @@ function defaultSchedulerConfig() {
       timezone: "Asia/Shanghai",
       lastRunDate: "",
       lastJobId: "",
+    },
+    nakedK: {
+      enabled: true,
+      timezone: "Asia/Shanghai",
+      phases: {
+        preflight: { time: "09:00", lastRunDate: "", lastJobId: "", attempts: 0, lastStatus: "waiting" },
+        open: { time: "09:25", lastRunDate: "", lastJobId: "", attempts: 0, lastStatus: "waiting" },
+        tail: { time: "14:50", lastRunDate: "", lastJobId: "", attempts: 0, lastStatus: "waiting" },
+        settle: { time: "15:10", lastRunDate: "", lastJobId: "", attempts: 0, lastStatus: "waiting" },
+      },
+    },
+    nakedKLive: {
+      enabled: true,
+      timezone: "Asia/Shanghai",
+      preflightTime: "09:00",
+      openTime: "09:25",
+      firstIntradayTime: "09:35",
+      lastIntradayTime: "14:55",
+      lastPreflightDate: "",
+      lastOpenDate: "",
+      lastIntradaySlot: "",
+      lastJobId: "",
+      lastStatus: "waiting",
+      runningPhase: "",
     },
   };
 }
@@ -137,6 +432,18 @@ function loadSchedulerConfig() {
     dataUpdate: {
       ...defaults.dataUpdate,
       ...(loaded.dataUpdate || {}),
+    },
+    nakedK: {
+      ...defaults.nakedK,
+      ...(loaded.nakedK || {}),
+      phases: {
+        ...defaults.nakedK.phases,
+        ...(loaded.nakedK?.phases || {}),
+      },
+    },
+    nakedKLive: {
+      ...defaults.nakedKLive,
+      ...(loaded.nakedKLive || {}),
     },
   };
 }
@@ -179,6 +486,71 @@ function schedulerStatus() {
 function schedulerTick() {
   const config = loadSchedulerConfig();
   const dataUpdate = config.dataUpdate;
+  const liveConfig = config.nakedKLive;
+  if (liveConfig.enabled) {
+    const now = localParts(liveConfig.timezone);
+    const weekday = new Intl.DateTimeFormat("en-US", { timeZone: liveConfig.timezone, weekday: "short" }).format(new Date());
+    const isWeekday = weekday !== "Sat" && weekday !== "Sun";
+    const launchLive = (phase: "preflight" | "open" | "intraday", slot: string) => {
+      const env = parseEnv(ENV_PATH);
+      const args = ["bin/naked_k_llm_live_runner.py", "--phase", phase, "--date", now.date];
+      if (phase === "intraday") args.push("--at", now.time);
+      const job = startJob(`naked-k-live-${phase}-${slot}`, OPS_HOME, env.PYTHON_BIN || "python3", args, (code) => {
+        const latest = loadSchedulerConfig();
+        latest.nakedKLive.lastStatus = code === 0 ? "success" : "failed";
+        latest.nakedKLive.runningPhase = "";
+        if (code === 0 && phase === "preflight") latest.nakedKLive.lastPreflightDate = now.date;
+        if (code === 0 && phase === "open") latest.nakedKLive.lastOpenDate = now.date;
+        saveSchedulerConfig(latest);
+      });
+      liveConfig.lastJobId = job.id;
+      liveConfig.lastStatus = "running";
+      liveConfig.runningPhase = phase;
+    };
+    if (isWeekday && !liveConfig.runningPhase && now.time >= liveConfig.preflightTime && now.time < "15:00" && liveConfig.lastPreflightDate !== now.date) {
+      launchLive("preflight", now.date);
+    }
+    if (isWeekday && !liveConfig.runningPhase && liveConfig.lastPreflightDate === now.date && now.time >= liveConfig.openTime && now.time < "15:00" && liveConfig.lastOpenDate !== now.date) {
+      launchLive("open", now.date);
+    }
+    const minute = Number(now.time.split(":")[1]);
+    const isFiveMinuteSlot = minute % 5 === 0;
+    const inMorning = now.time >= liveConfig.firstIntradayTime && now.time <= "11:30";
+    const inAfternoon = now.time >= "13:05" && now.time <= liveConfig.lastIntradayTime;
+    const slot = `${now.date}T${now.time}`;
+    if (isWeekday && !liveConfig.runningPhase && liveConfig.lastOpenDate === now.date && isFiveMinuteSlot && (inMorning || inAfternoon) && liveConfig.lastIntradaySlot !== slot) {
+      launchLive("intraday", slot);
+      liveConfig.lastIntradaySlot = slot;
+    }
+    saveSchedulerConfig(config);
+  }
+  if (config.nakedK.enabled) {
+    const nakedNow = localParts(config.nakedK.timezone);
+    const weekday = new Intl.DateTimeFormat("en-US", { timeZone: config.nakedK.timezone, weekday: "short" }).format(new Date());
+    if (weekday !== "Sat" && weekday !== "Sun") {
+      for (const [phase, phaseConfig] of Object.entries(config.nakedK.phases)) {
+        if (nakedNow.time < phaseConfig.time || phaseConfig.lastRunDate === nakedNow.date) continue;
+        const env = parseEnv(ENV_PATH);
+        const newDay = phaseConfig.lastRunDate !== nakedNow.date;
+        const attempts = newDay ? 1 : Number(phaseConfig.attempts || 0) + 1;
+        if (!newDay && attempts > 3) continue;
+        const job = startJob(`naked-k-${phase}`, OPS_HOME, env.PYTHON_BIN || "python3", [
+          "bin/naked_k_daily_runner.py", "--phase", phase, "--date", nakedNow.date,
+        ], (code) => {
+          const latest = loadSchedulerConfig();
+          const saved = latest.nakedK.phases[phase as keyof typeof latest.nakedK.phases];
+          saved.lastStatus = code === 0 ? "success" : "failed";
+          if (code !== 0 && Number(saved.attempts || 0) < 3) saved.lastRunDate = "";
+          saveSchedulerConfig(latest);
+        });
+        phaseConfig.lastRunDate = nakedNow.date;
+        phaseConfig.lastJobId = job.id;
+        phaseConfig.attempts = attempts;
+        phaseConfig.lastStatus = "running";
+      }
+      saveSchedulerConfig(config);
+    }
+  }
   if (!dataUpdate.enabled) return;
   const now = localParts(dataUpdate.timezone);
   const key = `${now.date} ${now.time}`;
@@ -290,14 +662,74 @@ function loadStatus() {
   };
 }
 
-function loadShortHoldStatus() {
+type ShortHoldProfile = "v2" | "v3" | "v5";
+
+function loadShortHoldStatus(profile: ShortHoldProfile = "v2") {
   const env = parseEnv(ENV_PATH);
-  const stateDir = env.SHORT_HOLD_STATE_DIR || resolve(OPS_HOME, "state", "short_hold_single_peak");
-  const reportDir = env.SHORT_HOLD_REPORT_DIR || resolve(OPS_HOME, "reports", "short_hold_single_peak");
-  const taskDir = env.SHORT_HOLD_TASK_DIR || resolve(OPS_HOME, "short_hold_tasks");
-  const submissionDir = env.SHORT_HOLD_SUBMISSION_DIR || resolve(OPS_HOME, "short_hold_submissions");
-  const fillDir = env.SHORT_HOLD_FILL_DIR || resolve(OPS_HOME, "short_hold_fills");
-  const snapshotDir = env.SHORT_HOLD_SNAPSHOT_DIR || resolve(OPS_HOME, "short_hold_daily_snapshots");
+  const isV3 = profile === "v3";
+  const isV5 = profile === "v5";
+  const stateDir = isV5
+    ? env.SHORT_HOLD_V5_STATE_DIR || resolve(OPS_HOME, "state", "short_hold_v5_baseline")
+    : isV3
+    ? env.SHORT_HOLD_V3_STATE_DIR || resolve(OPS_HOME, "state", "short_hold_v3")
+    : env.SHORT_HOLD_STATE_DIR || resolve(OPS_HOME, "state", "short_hold_single_peak");
+  const reportDir = isV5
+    ? env.SHORT_HOLD_V5_REPORT_DIR || resolve(OPS_HOME, "reports", "short_hold_v5_baseline")
+    : isV3
+    ? env.SHORT_HOLD_V3_REPORT_DIR || resolve(OPS_HOME, "reports", "short_hold_v3")
+    : env.SHORT_HOLD_REPORT_DIR || resolve(OPS_HOME, "reports", "short_hold_single_peak");
+  const taskDir = isV5
+    ? env.SHORT_HOLD_V5_TASK_DIR || resolve(OPS_HOME, "short_hold_v5_tasks")
+    : isV3
+    ? env.SHORT_HOLD_V3_TASK_DIR || resolve(OPS_HOME, "short_hold_v3_tasks")
+    : env.SHORT_HOLD_TASK_DIR || resolve(OPS_HOME, "short_hold_tasks");
+  const submissionDir = isV5
+    ? env.SHORT_HOLD_V5_SUBMISSION_DIR || resolve(OPS_HOME, "short_hold_v5_submissions")
+    : isV3
+    ? env.SHORT_HOLD_V3_SUBMISSION_DIR || resolve(OPS_HOME, "short_hold_v3_submissions")
+    : env.SHORT_HOLD_SUBMISSION_DIR || resolve(OPS_HOME, "short_hold_submissions");
+  const fillDir = isV5
+    ? env.SHORT_HOLD_V5_FILL_DIR || resolve(OPS_HOME, "short_hold_v5_fills")
+    : isV3
+    ? env.SHORT_HOLD_V3_FILL_DIR || resolve(OPS_HOME, "short_hold_v3_fills")
+    : env.SHORT_HOLD_FILL_DIR || resolve(OPS_HOME, "short_hold_fills");
+  const snapshotDir = isV5
+    ? env.SHORT_HOLD_V5_SNAPSHOT_DIR || resolve(OPS_HOME, "short_hold_v5_daily_snapshots")
+    : isV3
+    ? env.SHORT_HOLD_V3_SNAPSHOT_DIR || resolve(OPS_HOME, "short_hold_v3_daily_snapshots")
+    : env.SHORT_HOLD_SNAPSHOT_DIR || resolve(OPS_HOME, "short_hold_daily_snapshots");
+  const predDir = isV5
+    ? env.SHORT_HOLD_V5_PRED_DIR || resolve(OPS_HOME, "preds", "csi1000_short_hold_v5")
+    : isV3
+    ? env.SHORT_HOLD_V3_PRED_DIR || resolve(OPS_HOME, "preds", "csi1000_short_hold_v3")
+    : env.SHORT_HOLD_PRED_DIR || resolve(OPS_HOME, "preds", "csi1000_short_hold_v2");
+  const modelPackage = isV5
+    ? env.SHORT_HOLD_V5_MODEL_PACKAGE ||
+      resolve(OPS_HOME, "model_packages", "latest_csi1000_short_hold_v2_model_package.tar.gz")
+    : isV3
+    ? env.SHORT_HOLD_V3_MODEL_PACKAGE ||
+      resolve(OPS_HOME, "model_packages", "latest_csi1000_short_hold_v3_model_package.tar.gz")
+    : env.SHORT_HOLD_MODEL_PACKAGE || "";
+  const modelExtractDir = isV5
+    ? env.SHORT_HOLD_V5_MODEL_EXTRACT_DIR || resolve(OPS_HOME, "model_packages", "extracted", "short_hold_v5")
+    : isV3
+    ? env.SHORT_HOLD_V3_MODEL_EXTRACT_DIR ||
+      env.SHORT_HOLD_MODEL_EXTRACT_DIR ||
+      resolve(OPS_HOME, "model_packages", "extracted")
+    : env.SHORT_HOLD_MODEL_EXTRACT_DIR || "";
+  const autoPredict = isV5
+    ? env.SHORT_HOLD_V5_AUTO_PREDICT || env.SHORT_HOLD_AUTO_PREDICT || "1"
+    : isV3
+    ? env.SHORT_HOLD_V3_AUTO_PREDICT || env.SHORT_HOLD_AUTO_PREDICT || "1"
+    : env.SHORT_HOLD_AUTO_PREDICT || "";
+  const sideModelDir = isV3
+    ? env.SHORT_HOLD_V3_SIDE_MODEL_DIR || resolve(OPS_HOME, "model_packages", "short_hold_v3_side_models")
+    : "";
+  const sectorContextEnabled = isV3 ? env.SHORT_HOLD_V3_SECTOR_CONTEXT_ENABLED || "1" : "";
+  const researchProfile = isV3 ? env.SHORT_HOLD_V3_RESEARCH_PROFILE || "baseline" : "";
+  const sectorStockMeta = isV3
+    ? env.SHORT_HOLD_V3_STOCK_META || resolve(PAPER_HOME, "data", "meta", "tushare_stock_basic_latest.csv")
+    : "";
   const qlibDir = env.QLIB_PROVIDER_URI || resolve(PAPER_HOME, "data", "current");
   const navRows = readCsv(resolve(stateDir, "paper_nav.csv"));
   const positions = readCsv(resolve(stateDir, "paper_positions.csv"));
@@ -312,7 +744,19 @@ function loadShortHoldStatus() {
   const latestSignalRankings = latestFile(stateDir, "signal_rankings_", ".csv");
   const latestReport = latestFile(reportDir, "short_hold_fill_");
   const latestSnapshot = latestFile(snapshotDir, "short_hold_snapshot_", ".json");
-  const predPaths = [env.PRED_A, env.PRED_B, env.PRED_C].filter(Boolean);
+  const predPaths = isV3
+    ? [
+        env.SHORT_HOLD_V3_PRED_A || resolve(predDir, "xgb_csi1000_long_prod2026.pkl"),
+        env.SHORT_HOLD_V3_PRED_B || resolve(predDir, "doubleensemble_csi1000_short_prod2026.pkl"),
+        env.SHORT_HOLD_V3_PRED_C || resolve(predDir, "catboost_csi1000_long_prod2026.pkl"),
+      ].filter(Boolean)
+    : isV5
+      ? [
+          env.SHORT_HOLD_V5_PRED_A || resolve(predDir, "xgb_csi1000_long_prod2026.pkl"),
+          env.SHORT_HOLD_V5_PRED_B || resolve(predDir, "doubleensemble_csi1000_short_prod2026.pkl"),
+          env.SHORT_HOLD_V5_PRED_C || resolve(predDir, "catboost_csi1000_long_prod2026.pkl"),
+        ].filter(Boolean)
+    : [env.PRED_A, env.PRED_B, env.PRED_C].filter(Boolean);
   const calendarTail = tail(resolve(qlibDir, "calendars", "day.txt"), 8);
   const todayLocal = new Intl.DateTimeFormat("en-CA", {
     timeZone: "Asia/Shanghai",
@@ -328,6 +772,7 @@ function loadShortHoldStatus() {
   return {
     now: new Date().toISOString(),
     env: {
+      profile,
       qlibDir,
       stateDir,
       reportDir,
@@ -335,19 +780,43 @@ function loadShortHoldStatus() {
       submissionDir,
       fillDir,
       snapshotDir,
-      capital: env.SHORT_HOLD_CAPITAL || env.CAPITAL || "100000",
-      topk: env.SHORT_HOLD_TOPK || "4",
-      backupCount: env.SHORT_HOLD_BACKUP_COUNT || "3",
-      excludeRestrictedMarkets: env.SHORT_HOLD_EXCLUDE_RESTRICTED_MARKETS || "1",
-      minAmount: env.SHORT_HOLD_MIN_AMOUNT || "30000000",
-      maxPositionPct: env.SHORT_HOLD_MAX_POSITION_PCT || "0.70",
-      buyBudgetMode: env.SHORT_HOLD_BUY_BUDGET_MODE || env.BUY_BUDGET_MODE || "capital_pool",
-      reserveCashPct: env.SHORT_HOLD_RESERVE_CASH_PCT || "0.02",
-      scoreTemperature: env.SHORT_HOLD_SCORE_TEMPERATURE || "1.0",
-      scoringMode: env.SHORT_HOLD_SCORING_MODE || "v2",
+      predDir,
+      modelPackage,
+      modelExtractDir,
+      autoPredict,
+      sideModelDir,
+      capital: (isV5 ? env.SHORT_HOLD_V5_CAPITAL : isV3 ? env.SHORT_HOLD_V3_CAPITAL : env.SHORT_HOLD_CAPITAL) || env.SHORT_HOLD_CAPITAL || env.CAPITAL || "100000",
+      topk: (isV5 ? env.SHORT_HOLD_V5_TOPK : isV3 ? env.SHORT_HOLD_V3_TOPK : env.SHORT_HOLD_TOPK) || env.SHORT_HOLD_TOPK || "4",
+      backupCount: (isV5 ? env.SHORT_HOLD_V5_BACKUP_COUNT : isV3 ? env.SHORT_HOLD_V3_BACKUP_COUNT : env.SHORT_HOLD_BACKUP_COUNT) || env.SHORT_HOLD_BACKUP_COUNT || "3",
+      excludeRestrictedMarkets:
+        (isV5 ? env.SHORT_HOLD_V5_EXCLUDE_RESTRICTED_MARKETS : isV3 ? env.SHORT_HOLD_V3_EXCLUDE_RESTRICTED_MARKETS : env.SHORT_HOLD_EXCLUDE_RESTRICTED_MARKETS) ||
+        env.SHORT_HOLD_EXCLUDE_RESTRICTED_MARKETS ||
+        "1",
+      minAmount: (isV5 ? env.SHORT_HOLD_V5_MIN_AMOUNT : isV3 ? env.SHORT_HOLD_V3_MIN_AMOUNT : env.SHORT_HOLD_MIN_AMOUNT) || env.SHORT_HOLD_MIN_AMOUNT || "30000000",
+      maxPositionPct:
+        (isV5 ? env.SHORT_HOLD_V5_MAX_POSITION_PCT : isV3 ? env.SHORT_HOLD_V3_MAX_POSITION_PCT : env.SHORT_HOLD_MAX_POSITION_PCT) ||
+        env.SHORT_HOLD_MAX_POSITION_PCT ||
+        "0.70",
+      buyBudgetMode:
+        (isV5 ? env.SHORT_HOLD_V5_BUY_BUDGET_MODE : isV3 ? env.SHORT_HOLD_V3_BUY_BUDGET_MODE : env.SHORT_HOLD_BUY_BUDGET_MODE) ||
+        env.SHORT_HOLD_BUY_BUDGET_MODE ||
+        env.BUY_BUDGET_MODE ||
+        "capital_pool",
+      reserveCashPct:
+        (isV5 ? env.SHORT_HOLD_V5_RESERVE_CASH_PCT : isV3 ? env.SHORT_HOLD_V3_RESERVE_CASH_PCT : env.SHORT_HOLD_RESERVE_CASH_PCT) ||
+        env.SHORT_HOLD_RESERVE_CASH_PCT ||
+        "0.02",
+      scoreTemperature:
+        (isV5 ? env.SHORT_HOLD_V5_SCORE_TEMPERATURE : isV3 ? env.SHORT_HOLD_V3_SCORE_TEMPERATURE : env.SHORT_HOLD_SCORE_TEMPERATURE) ||
+        env.SHORT_HOLD_SCORE_TEMPERATURE ||
+        "1.0",
+      scoringMode: isV3 ? "v3" : "v2",
       v3Alpha: env.SHORT_HOLD_V3_ALPHA || "1.0",
-      v3Beta: env.SHORT_HOLD_V3_BETA || "2.0",
+      v3Beta: env.SHORT_HOLD_V3_BETA || "0.0",
       v3Gamma: env.SHORT_HOLD_V3_GAMMA || "0.0",
+      sectorContextEnabled,
+      researchProfile,
+      sectorStockMeta,
     },
     data: {
       currentLink: fileInfo(qlibDir),
@@ -356,6 +825,7 @@ function loadShortHoldStatus() {
       todayLocal,
     },
     predictions: predPaths.map((p) => fileInfo(p)),
+    sideModelArtifacts: isV3 ? sideModelArtifacts(sideModelDir) : [],
     account: {
       latestNav: navRows.at(-1) || null,
       positions,
@@ -449,20 +919,72 @@ function formatPercent(value: unknown, digits = 2): string {
   return n === null ? "" : `${(n * 100).toFixed(digits)}%`;
 }
 
+function optionalFiniteNumber(value: unknown): number | null {
+  if (value === undefined || value === null || String(value).trim() === "") {
+    return null;
+  }
+  return finiteNumber(value);
+}
+
+function optionalFormatNumber(value: unknown, digits: number): string {
+  const n = optionalFiniteNumber(value);
+  return n === null ? "" : n.toFixed(digits);
+}
+
+function optionalFormatPercent(value: unknown, digits = 2): string {
+  const n = optionalFiniteNumber(value);
+  return n === null ? "" : `${(n * 100).toFixed(digits)}%`;
+}
+
 function v3ValueColumns(row: Record<string, string>): Record<string, string> {
-  const hasV3Values = [row.final_score, row.buyability_risk, row.strong_prob, row.liquidity_risk].some(
-    (value) => finiteNumber(value) !== null,
+  const hasV3Values = [
+    row.final_score,
+    row.buyable_score,
+    row.strong_score,
+    row.buyability_risk,
+    row.strong_prob,
+    row.liquidity_risk,
+    row.liquidity_quality_score,
+    row.industry,
+    row.sector_context_note,
+    row.sector_heat_score,
+    row.sector_return_3d,
+    row.sector_breadth_1d,
+  ].some(
+    (value) => finiteNumber(value) !== null || String(value || "").trim() !== "",
   );
   if (!hasV3Values) {
     return {};
   }
+  const buyabilityRisk = optionalFiniteNumber(row.buyability_risk);
+  const buyableScore = optionalFiniteNumber(row.buyable_score) ?? (buyabilityRisk === null ? null : 1 - buyabilityRisk);
+  const strongScore = optionalFiniteNumber(row.strong_score) ?? optionalFiniteNumber(row.strong_prob);
   return {
-    return_score: formatNumber(row.return_score || row.score, 6),
-    final_score: formatNumber(row.final_score, 6),
-    buyability_risk: formatPercent(row.buyability_risk),
-    strong_prob: formatPercent(row.strong_prob),
-    liquidity_risk: formatNumber(row.liquidity_risk, 4),
+    return_score: optionalFormatNumber(row.return_score || row.score, 6),
+    return_rank_score: optionalFormatNumber(row.return_rank_score, 4),
+    buyable_score: buyableScore === null ? "" : buyableScore.toFixed(4),
+    strong_score: strongScore === null ? "" : strongScore.toFixed(4),
+    final_score: optionalFormatNumber(row.final_score, 6),
+    buyability_risk: optionalFormatPercent(row.buyability_risk),
+    strong_prob: optionalFormatPercent(row.strong_prob),
+    liquidity_risk: optionalFormatNumber(row.liquidity_risk, 4),
+    liquidity_quality_score: optionalFormatNumber(row.liquidity_quality_score, 4),
+    model_agreement_score: optionalFormatNumber(row.model_agreement_score, 4),
+    sector_rank_score: optionalFormatNumber(row.sector_rank_score, 4),
+    relative_sector_rank_score: optionalFormatNumber(row.relative_sector_rank_score, 4),
+    market_regime: row.market_regime || "",
+    research_profile: row.research_profile || "baseline",
+    research_profile_note: row.research_profile_note || "",
     score_source: row.score_source || "v3",
+    industry: row.industry || "",
+    sector_return_1d: optionalFormatPercent(row.sector_return_1d),
+    sector_return_3d: optionalFormatPercent(row.sector_return_3d),
+    sector_return_5d: optionalFormatPercent(row.sector_return_5d),
+    sector_breadth_1d: optionalFormatPercent(row.sector_breadth_1d),
+    sector_amount_ratio_5d: optionalFormatNumber(row.sector_amount_ratio_5d, 2),
+    stock_vs_sector_return_3d: optionalFormatPercent(row.stock_vs_sector_return_3d),
+    sector_heat_score: optionalFormatNumber(row.sector_heat_score, 4),
+    sector_context_note: row.sector_context_note || "",
   };
 }
 
@@ -579,7 +1101,7 @@ function validateDate(date: unknown): string {
   return normalized;
 }
 
-function startJob(name: string, cwd: string, command: string, args: string[]): Job {
+function startJob(name: string, cwd: string, command: string, args: string[], onClose?: (code: number | null) => void): Job {
   const id = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const job: Job = { id, name, status: "running", startedAt: new Date().toISOString(), log: "" };
   jobs.set(id, job);
@@ -594,6 +1116,7 @@ function startJob(name: string, cwd: string, command: string, args: string[]): J
     job.exitCode = code;
     job.finishedAt = new Date().toISOString();
     job.status = code === 0 ? "success" : "failed";
+    onClose?.(code);
   });
   child.on("error", (err) => {
     job.status = "failed";
@@ -601,6 +1124,77 @@ function startJob(name: string, cwd: string, command: string, args: string[]): J
     job.log += `\n${err.stack || err.message}\n`;
   });
   return job;
+}
+
+function runJsonCommand(command: string, args: string[], cwd: string): Promise<Record<string, unknown>> {
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn(command, args, { cwd, env: process.env });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on("error", reject);
+    child.on("close", (code) => {
+      let result: Record<string, unknown> | null = null;
+      try {
+        result = JSON.parse(stdout.trim()) as Record<string, unknown>;
+      } catch {
+        reject(new Error(stderr.trim() || stdout.trim() || "查询模型分数失败"));
+        return;
+      }
+      if (code !== 0) {
+        reject(new Error(cleanText(result.error) || stderr.trim() || "查询模型分数失败"));
+        return;
+      }
+      resolvePromise(result);
+    });
+  });
+}
+
+async function lookupShortHoldV2Score(code: string): Promise<Record<string, unknown>> {
+  const env = parseEnv(ENV_PATH);
+  const predDir = env.SHORT_HOLD_PRED_DIR || resolve(OPS_HOME, "preds", "csi1000_short_hold_v2");
+  const predictions = [
+    env.PRED_A || resolve(predDir, "xgb_csi1000_long_prod2026.pkl"),
+    env.PRED_B || resolve(predDir, "doubleensemble_csi1000_short_prod2026.pkl"),
+    env.PRED_C || resolve(predDir, "catboost_csi1000_long_prod2026.pkl"),
+  ];
+  const missing = predictions.filter((path) => !existsSync(path));
+  if (missing.length) throw new Error(`Short Hold V2 预测文件不存在: ${missing.join(", ")}`);
+  const python = env.PYTHON_BIN || "python3";
+  return runJsonCommand(python, [
+    resolve(OPS_HOME, "bin", "query_short_hold_v2_score.py"),
+    "--pred-a", predictions[0],
+    "--pred-b", predictions[1],
+    "--pred-c", predictions[2],
+    "--weights", env.WEIGHTS || "3,1,1",
+    "--code", code,
+  ], OPS_HOME);
+}
+
+async function lookupShortHoldV5Score(code: string): Promise<Record<string, unknown>> {
+  const env = parseEnv(ENV_PATH);
+  const predDir = env.SHORT_HOLD_V5_PRED_DIR || resolve(OPS_HOME, "preds", "csi1000_short_hold_v5");
+  const predictions = [
+    env.SHORT_HOLD_V5_PRED_A || resolve(predDir, "xgb_csi1000_long_prod2026.pkl"),
+    env.SHORT_HOLD_V5_PRED_B || resolve(predDir, "doubleensemble_csi1000_short_prod2026.pkl"),
+    env.SHORT_HOLD_V5_PRED_C || resolve(predDir, "catboost_csi1000_long_prod2026.pkl"),
+  ];
+  const missing = predictions.filter((path) => !existsSync(path));
+  if (missing.length) throw new Error(`Short Hold V5 基线预测文件不存在: ${missing.join(", ")}`);
+  const python = env.PYTHON_BIN || "python3";
+  return runJsonCommand(python, [
+    resolve(OPS_HOME, "bin", "query_short_hold_v2_score.py"),
+    "--pred-a", predictions[0],
+    "--pred-b", predictions[1],
+    "--pred-c", predictions[2],
+    "--weights", env.WEIGHTS || "3,1,1",
+    "--code", code,
+  ], OPS_HOME);
 }
 
 async function parseJsonBody(req: IncomingMessageLike): Promise<Record<string, unknown>> {
@@ -679,7 +1273,7 @@ function html() {
 <body>
   <header>
     <h1>Local Trade Ops</h1>
-    <p class="muted">数据更新、信号生成、人工 review、实盘任务触发、收益展示。<a href="/short-hold" style="color:#8a4f18;font-weight:800;">进入单峰短持有页面</a></p>
+    <p class="muted">数据更新、信号生成、人工 review、实盘任务触发、收益展示。<a href="/short-hold" style="color:#8a4f18;font-weight:800;">进入单峰短持有页面</a> ｜ <a href="/short-hold-v5" style="color:#8a4f18;font-weight:800;">进入 V5 冻结基线页面</a></p>
   </header>
   <main>
     <section>
@@ -909,13 +1503,42 @@ function html() {
 </html>`;
 }
 
-function shortHoldHtml() {
+function shortHoldHtml(profile: ShortHoldProfile = "v2") {
+  const isV3 = profile === "v3";
+  const isV5 = profile === "v5";
+  const title = isV3 ? "Short Hold V3 Ops" : isV5 ? "Short Hold V5 Baseline" : "Short Hold Ops";
+  const apiBase = isV3 ? "/api/short-hold-v3" : isV5 ? "/api/short-hold-v5" : "/api/short-hold";
+  const siblingLink = isV3
+    ? '<a href="/short-hold">返回 V2 短持有页面</a>'
+    : isV5
+      ? '<a href="/short-hold">返回 V2 短持有页面</a> ｜ <a href="/short-hold-v3">进入 V3 独立实验页面</a>'
+      : '<a href="/short-hold-v3">进入 V3 独立实验页面</a> ｜ <a href="/short-hold-v5">进入 V5 冻结基线页面</a>';
+  const scoringDescription = isV3
+    ? "短持有 V3 独立实验：复用短持收益模型预测，再用 v3 侧模型/重排逻辑独立生成清单。"
+    : isV5
+      ? "短持有 V5 冻结基线：策略、融合权重和过滤规则与 V2 保持一致，但使用独立预测、订单、回填、日报和账本目录。"
+      : "单峰短持有策略：T 信号，T+1 人工买入，T+2 尾盘/收盘卖出。";
+  const researchSection = isV3
+    ? `<section class="span-all">
+      <h2>最新 V3 研究报告</h2>
+      <div id="research"></div>
+    </section>`
+    : "";
+  const v2ScoreLookup = isV3
+    ? ""
+    : `<div class="score-lookup">
+        <b>查询单只股票当日模型分</b><br>
+        <span class="muted">输入代码，查看 Short Hold ${isV5 ? "V5 基线" : "V2"} 最新信号日的融合分与排名，不生成订单。</span><br>
+        <input id="v2ScoreCode" maxlength="8" placeholder="601225 或 SH601225" />
+        <button type="button" id="v2ScoreButton" class="secondary">查询分数</button>
+        <span id="v2ScoreResult" class="muted"></span>
+      </div>`;
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Short Hold Ops</title>
+  <title>${title}</title>
   <style>
     :root { color-scheme: light; --ink:#1d241f; --muted:#68736b; --line:#d9dfd7; --bg:#f5f0e4; --card:#fffdf6; --accent:#8a4f18; --green:#0e7c66; }
     body { margin:0; font-family: ui-serif, Georgia, "Times New Roman", serif; background: radial-gradient(circle at 18% 0%, #f7d9a7, transparent 26rem), var(--bg); color:var(--ink); }
@@ -946,7 +1569,19 @@ function shortHoldHtml() {
     .grid { display:grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap:12px; }
     table { width:100%; border-collapse:collapse; font-size:13px; }
     td, th { border-bottom:1px solid var(--line); padding:7px; text-align:left; }
+    .decision-table-wrap { overflow-x:auto; border:1px solid var(--line); border-radius:12px; background:#fffdf8; }
+    .decision-table { min-width:0; table-layout:fixed; font-size:12px; }
+    .decision-table th { background:#fff1d8; color:#5d3918; white-space:normal; }
+    .decision-table td { white-space:pre-line; line-height:1.4; vertical-align:top; overflow-wrap:anywhere; }
+    .decision-rank { font-weight:900; color:#8a4f18; }
+    .decision-guide { margin:8px 0 10px; padding:10px 12px; border-radius:12px; background:#eef7ef; border:1px solid #c9dfc9; line-height:1.55; }
+    .diagnostic { margin-top:12px; border:1px solid var(--line); border-radius:12px; padding:0 12px 12px; }
+    .diagnostic summary { cursor:pointer; padding:10px 0; font-weight:800; color:#5d3918; }
     input { padding:7px 9px; border-radius:10px; border:1px solid var(--line); width:90px; }
+    .score-lookup { margin-top:12px; padding:11px 12px; border:1px solid #d6c39f; border-radius:12px; background:#fffaf0; line-height:1.55; }
+    .score-lookup input { width:170px; margin:7px 4px 0 0; }
+    .score-lookup button { padding:8px 12px; }
+    #v2ScoreResult { display:inline-block; margin-left:6px; font-weight:800; }
     pre { white-space:pre-wrap; background:#17231f; color:#ecf7ed; padding:14px; border-radius:12px; max-height:320px; overflow:auto; }
     .muted { color:var(--muted); }
     .submit-row { display:flex; justify-content:flex-end; margin:14px 0 4px; }
@@ -956,8 +1591,8 @@ function shortHoldHtml() {
 </head>
 <body>
   <header>
-    <h1>Short Hold Ops</h1>
-    <p class="muted">单峰短持有策略：T 信号，T+1 人工买入，T+2 尾盘/收盘卖出。<nav><a href="/">返回原 T/T+1 页面</a></nav></p>
+    <h1>${title}</h1>
+    <p class="muted">${scoringDescription}<nav><a href="/">返回原 T/T+1 页面</a> ｜ ${siblingLink}</nav></p>
   </header>
   <main>
     <section>
@@ -965,8 +1600,9 @@ function shortHoldHtml() {
       <div class="cards">
         <div class="card">
           <h3>1. 生成短持有清单</h3>
-          <p class="muted">复用原来的数据更新和 PKL 推理，然后生成短持有专用 BUY/SELL 清单。SELL 是到期持仓，BUY 是新一轮信号。</p>
+          <p class="muted">复用原来的数据更新和 PKL 推理，然后生成${isV3 ? " v3 独立" : ""}短持有专用 BUY/SELL 清单。SELL 是到期持仓，BUY 是新一轮信号。</p>
           <button onclick="run('prepare-short-hold-orders')">生成短持有清单</button>
+          ${v2ScoreLookup}
         </div>
         <div class="card">
           <h3>2. 回填成交 / 日报</h3>
@@ -980,7 +1616,7 @@ function shortHoldHtml() {
         卖出：T+2 尾盘/收盘前按到期 SELL 清单优先完成。<br>
         A股交易时间：09:15-09:25 开盘集合竞价；09:30-11:30 上午连续竞价；13:00-14:57 下午连续竞价；14:57-15:00 收盘集合竞价。<br>
         操作节奏：09:25 只观察；09:30-09:35 买入；14:57 前后开始检查到期 SELL，15:00 前完成能成交的卖出。<br>
-        当前默认初始资金池：<b>10W</b>；生成手工清单时默认按整体资金池做 BUY 预算，不受模拟账本剩余现金影响；如需实盘口径，可设置 SHORT_HOLD_BUY_BUDGET_MODE=available_cash。默认参数：top4、min_amount=3000万、max_position_pct=70%、softmax 分配。
+        当前默认初始资金池：<b>10W</b>；生成手工清单时默认按整体资金池做 BUY 预算，不受模拟账本剩余现金影响；如需实盘口径，可设置 SHORT_HOLD_BUY_BUDGET_MODE=available_cash。${isV3 ? "V3 当前部署为 Top2 主推荐，行业/一致性/流动性评分只作排序与解释。" : "默认参数：top4、min_amount=3000万、max_position_pct=70%、softmax 分配。"}
         <div><span class="pill">独立账本</span><span class="pill">独立回填</span><span class="pill">独立日报</span></div>
       </div>
       <div id="jobSummary" class="job-card">等待操作...</div>
@@ -997,12 +1633,16 @@ function shortHoldHtml() {
       <h2>短持有订单</h2>
       <div id="orders"></div>
     </section>
+    ${researchSection}
     <section class="span-all">
       <h2>任务日志</h2>
       <pre id="jobs">loading...</pre>
     </section>
   </main>
   <script>
+    const API_BASE = '${apiBase}';
+    const IS_V3 = ${isV3 ? "true" : "false"};
+    const SCORE_API = '${isV5 ? "/api/short-hold-v5/v5-score" : "/api/short-hold/v2-score"}';
     async function api(path, body) {
       const res = await fetch(path, body ? {method:'POST', headers:{'content-type':'application/json'}, body:JSON.stringify(body)} : {});
       if (!res.ok) throw new Error(await res.text());
@@ -1029,11 +1669,26 @@ function shortHoldHtml() {
       entry_score: '入仓分',
       signal_score: '当日分',
       return_score: '收益分',
+      return_rank_score: '收益排名分',
       final_score: '最终分',
-      buyability_risk: '买入风险',
+      buyability_risk: '买入风险(仅展示)',
       strong_prob: '强势概率',
       liquidity_risk: '流动性风险',
+      liquidity_quality_score: '流动性质量',
+      model_agreement_score: '模型一致性',
+      sector_rank_score: '行业热度排名',
+      relative_sector_rank_score: '相对行业排名',
+      market_regime: '市场状态',
       score_source: '打分源',
+      industry: '行业',
+      sector_return_1d: '行业1日',
+      sector_return_3d: '行业3日',
+      sector_return_5d: '行业5日',
+      sector_breadth_1d: '行业上涨占比',
+      sector_amount_ratio_5d: '行业量能',
+      stock_vs_sector_return_3d: '个股超行业3日',
+      sector_heat_score: '行业热度',
+      sector_context_note: '行业判断',
       alloc_weight: '分配权重',
       target_value: '目标金额',
       planned_value: '计划金额',
@@ -1057,6 +1712,78 @@ function shortHoldHtml() {
       const cols = tableColumns(rows);
       return '<table><thead><tr>' + cols.map(c => '<th>'+escapeHtml(LABELS[c] || c)+'</th>').join('') + '</tr></thead><tbody>' +
         rows.map(r => '<tr>' + cols.map(c => '<td>'+escapeHtml(r[c] ?? '')+'</td>').join('') + '</tr>').join('') + '</tbody></table>';
+    }
+    function v3DecisionTable(rows, columns) {
+      if (!rows || !rows.length) return '<p class="muted">暂无</p>';
+      return '<div class="decision-table-wrap"><table class="decision-table"><thead><tr>' +
+        columns.map(c => '<th>' + escapeHtml(c.label) + '</th>').join('') +
+        '</tr></thead><tbody>' + rows.map((row, index) => '<tr>' + columns.map(column => {
+          const value = column.value ? column.value(row, index) : row[column.key];
+          return '<td>' + escapeHtml(value ?? '-') + '</td>';
+        }).join('') + '</tr>').join('') + '</tbody></table></div>';
+    }
+    function renderV3OrderBlock(rows, env) {
+      const sells = rows.filter(row => row.action === 'SELL');
+      const primaryBuys = rows.filter(row => row.action === 'BUY' && row.role === 'primary');
+      const backups = rows.filter(row => row.action === 'BUY' && row.role === 'backup');
+      const expectedTopk = Number(env.topk || 2);
+      const capital = Number(env.capital || 0);
+      const plannedValue = row => {
+        const raw = row.planned_value;
+        if (raw === undefined || raw === null || String(raw).trim() === '') return null;
+        const value = Number(raw);
+        return Number.isFinite(value) ? value : null;
+      };
+      const plannedWeight = row => {
+        const value = plannedValue(row);
+        return value === null || capital <= 0 ? '-' : (value / capital * 100).toFixed(1) + '%';
+      };
+      const twoLine = (first, second) => first + '\\n' + second;
+      const outputProfile = rows.find(row => row.research_profile)?.research_profile || '';
+      const profileChanged = rows.length > 0 && (!outputProfile || outputProfile !== (env.researchProfile || 'baseline'));
+      const buyColumns = [
+        { label: '主推荐', value: (_, index) => 'Top' + (index + 1) },
+        { label: '股票 / 行业', value: row => twoLine(row.code || '-', row.industry || '行业待生成') },
+        { label: '计划仓位', value: plannedWeight },
+        { label: '价格指引', value: row => twoLine('参考 ' + (row.ref_price || '-'), '红线 ' + (row.price_5pct || '-')) },
+        { label: '模型分', value: row => twoLine('最终 ' + (row.final_score || '-'), '收益 ' + (row.return_score || '-')) },
+        { label: '行业分', value: row => twoLine('热度 ' + (row.sector_heat_score || '-'), '3日 ' + (row.sector_return_3d || '-')) },
+        { label: '相对行业', key: 'stock_vs_sector_return_3d' },
+        { label: '质量分', value: row => twoLine('一致 ' + (row.model_agreement_score || '-'), '流动 ' + (row.liquidity_quality_score || '-')) },
+        { label: '市场状态', key: 'market_regime' },
+      ];
+      const sellColumns = [
+        { label: '优先级', value: () => '先卖' },
+        { label: '代码', key: 'code' },
+        { label: '股数', key: 'shares' },
+        { label: '退出日', key: 'exit_date' },
+        { label: '参考价', key: 'ref_price' },
+        { label: '入仓分', key: 'entry_score' },
+      ];
+      const backupColumns = [
+        { label: '备选顺序', value: (_, index) => '备选 ' + (index + 1) },
+        { label: '代码', key: 'code' },
+        { label: '行业', key: 'industry' },
+        { label: '股数', key: 'shares' },
+        { label: '5%红线', key: 'price_5pct' },
+        { label: '最终推荐分', key: 'final_score' },
+        { label: '行业热度', key: 'sector_heat_score' },
+        { label: '模型一致性', key: 'model_agreement_score' },
+        { label: '流动性质量', key: 'liquidity_quality_score' },
+      ];
+      const warning = profileChanged
+        ? '<p class="risk"><b>这是历史清单，不能按当前 V3 策略解读。</b>' + (outputProfile ? '其 Profile 为 ' + escapeHtml(outputProfile) + '。' : '该文件没有 V3 行业/一致性/流动性字段。') + '当前部署为 ' + escapeHtml(env.researchProfile || 'top2_full') + ' / Top' + escapeHtml(expectedTopk) + '。请点击「生成短持有清单」后再按新策略操作。</p>'
+        : '';
+      const sellBlock = sells.length
+        ? '<h3>优先：到期卖出</h3><p class="muted">SELL 与本轮新推荐无关，按到期日先完成卖出。</p>' + v3DecisionTable(sells, sellColumns)
+        : '';
+      const buyBlock = '<h3>今日应买：Top' + escapeHtml(expectedTopk) + ' 主推荐</h3>' +
+        '<div class="decision-guide"><b>只看本表决定是否买入。</b>按 Top1、Top2 的顺序人工检查盘口；不追涨停，委托价不超过 5% 红线。只有对应主推荐买不进/高开超线/未成交时，才看下方备选组合。</div>' +
+        v3DecisionTable(primaryBuys, buyColumns);
+      const backupBlock = backups.length
+        ? '<details class="diagnostic"><summary>查看备选组合（主推荐无法买入时才使用）</summary><p class="muted">备选不与主推荐同时买入；主单释放的预算会在备选中重新 softmax 分配。</p>' + v3DecisionTable(backups, backupColumns) + '</details>'
+        : '';
+      return warning + sellBlock + buyBlock + backupBlock;
     }
     function fillEditor(rows) {
       if (!rows || !rows.length) return '<p class="muted">暂无回填模板。先生成短持有清单。</p>';
@@ -1119,12 +1846,19 @@ function shortHoldHtml() {
         ? (firstBuy.signal_date + ' 信号；' + firstBuy.execution_date + ' 开盘人工买；' + firstBuy.exit_date + ' 尾盘/收盘卖')
         : '生成清单后会显示具体 signal / execution / exit 日期';
       const scoringText = s.env.scoringMode === 'v3'
-        ? '当前为 v3 重排：原始分是收益模型分；最终分 = 收益分 - 买入风险惩罚 + 强势概率加分 - 流动性惩罚，用于排序和 softmax 分配。'
+        ? '当前为 v3 重排：原始分是收益模型分；最终分由当前 V3 Profile 决定，用于排序和 softmax 分配；买入风险只展示，不扣分。'
         : '当前为 v2：按原始收益模型分排序和 softmax 分配。';
+      const orderBlock = IS_V3 ? renderV3OrderBlock(rows, s.env) : table(rows);
+      const reviewBlock = IS_V3
+        ? '<details class="diagnostic"><summary>诊断：模型 Top5 / 过滤检查</summary><p class="muted">仅排查时查看。score 是模型原始分；FILTERED 表示不会进入主单/备选池。</p>' + table(s.workflow.modelTopReviewRows) + '</details>'
+        : '<h3>模型 Top5 / 过滤检查</h3><p class="muted">score 是模型原始分；FILTERED 表示不会进入主单/备选池。</p>' + table(s.workflow.modelTopReviewRows);
+      const historyBlock = IS_V3
+        ? ''
+        : '<h3>近5个信号日 Filter 后 Top1</h3><p class="muted">来源：短持有 candidate review，排除 FILTERED/SKIPPED，只看已经通过过滤并可进入主单或 backup 的 BUY 候选。</p>' + table(s.workflow.recentFilteredTopRows);
       document.querySelector('#orders').innerHTML =
-        '<h3>近5个信号日 Filter 后 Top1</h3><p class="muted">来源：短持有 candidate review，排除 FILTERED/SKIPPED，只看已经通过过滤并可进入主单或 backup 的 BUY 候选。</p>' + table(s.workflow.recentFilteredTopRows) +
-        '<h3>模型 Top5 / 过滤检查</h3><p class="muted">score 是模型原始分；FILTERED 表示不会进入主单/备选池。</p>' + table(s.workflow.modelTopReviewRows) +
-        '<h3>手工下单清单</h3><p class="muted"><b>本轮节奏：</b>' + escapeHtml(timeline) + '。' + escapeHtml(scoringText) + ' role=primary 是主单；role=backup 是 primary 因涨停/高开/买不进/未成交时使用的组合补位，按释放主单资金重新 softmax 分配。入仓分是已有持仓当初买入时的分数，没有入仓则为空；当日分是最新信号日模型跑出的当天原始分。BUY 的 price_5pct 是最高买入红线；SELL 是到期持仓，优先卖出。</p>' + table(rows) +
+        historyBlock +
+        '<h3>' + (IS_V3 ? '本轮交易清单' : '手工下单清单') + '</h3><p class="muted"><b>本轮节奏：</b>' + escapeHtml(timeline) + '。' + escapeHtml(scoringText) + ' BUY 的 price_5pct 是最高买入红线；SELL 是到期持仓，优先卖出。</p>' + orderBlock +
+        reviewBlock +
         '<h3>成交回填</h3><p class="muted">填东方财富「当日成交」里的真实成交股数/均价；没成交填 0 或留空并备注。</p>' + fillEditor(s.workflow.fillTemplateRows) +
         '<div class="submit-row"><button onclick="run(\\'short-hold-apply-fills\\')" class="secondary">提交短持有回填</button></div>' +
         '<p class="muted">最新任务: ' + (s.workflow.latestTask || '-') +
@@ -1132,9 +1866,38 @@ function shortHoldHtml() {
         '<br>最新回填模板: ' + (s.workflow.latestFillTemplate || '-') +
         '<br>最新已应用成交: ' + (s.workflow.latestAppliedFills || '-') + '</p>';
     }
+    async function renderShortHoldV3Research() {
+      if (!IS_V3) return;
+      const target = document.querySelector('#research');
+      if (!target) return;
+      try {
+        const report = await api(API_BASE + '/research/latest');
+        const markdown = report.markdown || '';
+        const preview = markdown
+          ? markdown.slice(0, 2000)
+          : '暂无 V3 研究报告。可先运行 bin/run_short_hold_v3_candidate_lab.sh 生成 Candidate Lab 报告。';
+        target.innerHTML =
+          '<p class="muted"><b>报告路径</b>: ' + escapeHtml(report.reportPath || '-') + '</p>' +
+          '<pre>' + escapeHtml(preview) + '</pre>';
+      } catch (err) {
+        const message = err && err.message ? err.message : String(err);
+        target.innerHTML = '<p class="muted">读取 V3 研究报告失败：' + escapeHtml(message) + '</p>';
+      }
+    }
     async function refresh(options = {}) {
-      const s = await api('/api/short-hold/status');
+      const s = await api(API_BASE + '/status');
       jobSummary(s.jobs?.[0]);
+      const v3ModelBlock = s.env.profile === 'v3'
+        ? '<p><b>V3模型包</b>: ' + escapeHtml(s.env.modelPackage || '-') +
+          '<br><b>V3预测目录</b>: ' + escapeHtml(s.env.predDir || '-') +
+          '<br><b>V3自动推理</b>: ' + escapeHtml(s.env.autoPredict || '-') +
+          '<br><b>V3侧模型目录</b>: ' + escapeHtml(s.env.sideModelDir || '-') +
+          '<br><b>V3研究 Profile</b>: ' + escapeHtml(s.env.researchProfile || 'baseline') +
+          '<br><b>V3行业上下文</b>: ' + escapeHtml(s.env.sectorContextEnabled || '-') +
+          '<br><b>行业元数据</b>: ' + escapeHtml(s.env.sectorStockMeta || '-') +
+          '<br><b>模型解压目录</b>: ' + escapeHtml(s.env.modelExtractDir || '-') + '</p>' +
+          '<h3>V3 side model 文件</h3>' + table(s.sideModelArtifacts || [])
+        : '';
       document.querySelector('#account').innerHTML =
         '<div class="grid">' +
         '<div><b>NAV</b><br>' + (s.account.latestNav?.nav ?? '-') + '</div>' +
@@ -1145,16 +1908,18 @@ function shortHoldHtml() {
         '<p><b>本地最新交易日</b>: ' + (s.data.lastCalendarDate || '-') + ' ｜ 今天=' + s.data.todayLocal + '</p>' +
         '<p><b>今日短持有清单</b>: ' + (s.workflow.brokerTicketOrders?.length ? '已生成 ' + s.workflow.brokerTicketOrders.length + ' 条' : '暂无') + '</p>' +
         '<p><b>初始资金池</b>: ' + Number(s.env.capital || 100000).toLocaleString('zh-CN') + ' ｜ <b>BUY预算</b>: ' + budgetModeLabel(s.env.buyBudgetMode) + ' ｜ <b>策略</b>: top' + s.env.topk + ' + backup' + s.env.backupCount + ', scoring=' + s.env.scoringMode + ', maxPositionPct=' + s.env.maxPositionPct + ', minAmount=' + s.env.minAmount + ', temperature=' + s.env.scoreTemperature + ', 排除创业板/科创板=' + s.env.excludeRestrictedMarkets + '</p>' +
+        v3ModelBlock +
         '<p><b>数据日历</b>: ' + s.data.calendarTail.join(', ') + '</p>' +
         '<h3>持仓</h3>' + table(s.account.positions);
       if (options.forceOrders || (!isEditingFill() && !hasFillDraft())) renderOrders(s);
+      await renderShortHoldV3Research();
       renderSnapshot(s.workflow.latestSnapshotData);
       document.querySelector('#jobs').textContent = s.jobs.map(j => '['+j.status+'] '+j.name+' '+j.startedAt+'\\n'+j.log).join('\\n\\n') || '暂无任务';
       document.querySelector('#jobs').scrollTop = document.querySelector('#jobs').scrollHeight;
     }
     async function run(action) {
       try {
-        const status = await api('/api/short-hold/status');
+        const status = await api(API_BASE + '/status');
         const executionDate = status.workflow.defaultExecutionDate || status.data.todayLocal;
         document.querySelector('#jobSummary').textContent = '已触发 ' + action + '，正在执行...';
         if (action === 'short-hold-apply-fills') {
@@ -1168,9 +1933,9 @@ function shortHoldHtml() {
           if (!rows.length) return alert('暂无短持有回填模板，请先生成短持有清单');
           const hasFill = rows.some(row => Number(row.fill_shares || 0) > 0 && Number(row.fill_price || 0) > 0);
           if (!hasFill) return alert('还没有填写任何实际成交。');
-          await api('/api/short-hold/save-fills', {executionDate, rows});
+          await api(API_BASE + '/save-fills', {executionDate, rows});
         }
-        await api('/api/short-hold/run/' + action, {executionDate});
+        await api(API_BASE + '/run/' + action, {executionDate});
         setTimeout(() => refresh({forceOrders: true}), 1200);
       } catch (err) {
         const message = err && err.message ? err.message : String(err);
@@ -1178,11 +1943,80 @@ function shortHoldHtml() {
         alert('操作失败：' + message);
       }
     }
+    const v2ScoreButton = document.querySelector('#v2ScoreButton');
+    if (v2ScoreButton) {
+      v2ScoreButton.addEventListener('click', async () => {
+        const code = document.querySelector('#v2ScoreCode').value.trim();
+        const output = document.querySelector('#v2ScoreResult');
+        if (!code) return alert('请输入股票代码');
+        output.textContent = '查询中...';
+        try {
+          const result = await api(SCORE_API, { code });
+          output.textContent = result.found
+            ? '信号日 ' + result.signalDate + ' ｜ 融合分 ' + Number(result.score).toFixed(6) + ' ｜ 排名 ' + result.rank + ' / ' + result.universeSize
+            : '信号日 ' + result.signalDate + ' 未在候选池中找到 ' + result.code;
+        } catch (err) {
+          output.textContent = '查询失败：' + (err.message || String(err));
+        }
+      });
+    }
     refresh();
     setInterval(refresh, 30 * 60 * 1000);
   </script>
 </body>
 </html>`;
+}
+
+function recommendationsHtml() {
+  return `<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" /><title>Recommendation Journal</title>
+<style>
+:root{--ink:#17212b;--muted:#64748b;--line:#d8e0e8;--blue:#155e75;--orange:#b45309;--green:#166534;--red:#b42318}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:linear-gradient(135deg,#e6f1f5,#f9f5ed 50%,#eef4eb);font-family:ui-serif,Georgia,"Noto Serif SC",serif}header,main{max-width:1500px;margin:auto;padding-left:clamp(18px,4vw,54px);padding-right:clamp(18px,4vw,54px)}header{padding-top:34px;padding-bottom:20px}h1{margin:0;font-size:clamp(30px,4vw,48px);letter-spacing:-.045em}header p,.panel>p{color:var(--muted)}a{color:var(--blue);font-weight:700}.hero{display:flex;justify-content:space-between;gap:18px;align-items:end}.stats{display:grid;grid-template-columns:repeat(5,minmax(0,1fr));gap:10px}.stat,.panel{background:#ffffffd9;border:1px solid var(--line);border-radius:16px;box-shadow:0 10px 30px #18324a0b}.stat{padding:14px}.stat b{display:block;font-size:25px;margin-top:4px}.stat span{color:var(--muted);font-size:13px}main{display:grid;gap:18px;padding-bottom:42px}.panel{padding:18px}.panel h2{margin:0 0 6px;font-size:21px}form{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px}label{display:grid;gap:5px;font-weight:700;font-size:14px}.wide{grid-column:span 2}.full{grid-column:1/-1}input,textarea{width:100%;border:1px solid #cbd5df;border-radius:9px;background:#fff;padding:9px 10px;font:inherit;color:var(--ink)}textarea{min-height:78px;resize:vertical}button{border:0;border-radius:999px;padding:10px 16px;background:var(--blue);color:#fff;font:inherit;font-weight:700;cursor:pointer}.save{background:var(--orange);white-space:nowrap}.table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}.table-wrap table{min-width:1120px}table{width:100%;border-collapse:collapse;font-size:14px}th{background:#e8f1f5;text-align:left;white-space:nowrap}td,th{padding:10px 9px;border-bottom:1px solid var(--line);vertical-align:top}tr:last-child td{border:0}.status{display:inline-block;padding:3px 8px;border-radius:999px;background:#e5e7eb;white-space:nowrap;font-size:12px;font-weight:700}.status.持有中{background:#dcfce7;color:var(--green)}.status.已卖出{background:#dbeafe;color:#1d4ed8}.status.部分卖出{background:#fef3c7;color:#92400e}.fill{display:grid;grid-template-columns:70px 70px 110px;gap:5px}.fill input{padding:6px;min-width:0}.pnl-pos{color:var(--green);font-weight:700}.pnl-neg{color:var(--red);font-weight:700}.rationale{max-width:260px;white-space:pre-wrap;color:#475569}.empty{padding:32px;color:var(--muted);text-align:center}#message{min-height:22px;color:var(--muted);font-weight:700}@media(max-width:900px){.stats{grid-template-columns:repeat(2,1fr)}form{grid-template-columns:repeat(2,minmax(0,1fr))}.wide{grid-column:span 2}}@media(max-width:560px){.hero{display:block}form{grid-template-columns:1fr}.wide,.full{grid-column:auto}}
+</style></head>
+<body><header><div class="hero"><div><h1>Recommendation Journal</h1><p>独立记录第三方推荐、人工买卖回填与已实现结果。仅供交易日记使用，不构成投资建议。</p></div><a href="/">返回交易平台</a></div></header>
+<main><div class="stats" id="stats"></div>
+<section class="panel"><h2>录入推荐</h2><p>每天通常 2 只。完整理由、风险提示与投顾信息会原样保存，方便后续复盘。</p>
+<form id="createForm"><label>来源/服务<input name="source" value="龙头掘金" required /></label><label>入选日期<input name="recommendationDate" type="date" required /></label><label>股票代码<input name="code" placeholder="601225" required /></label><label>股票名称<input name="name" placeholder="陕西煤业" required /></label><label>关注价格<input name="focusPrice" placeholder="24-25元" /></label><label>参考仓位<input name="suggestedPosition" placeholder="1成仓" /></label><label>目标价格<input name="targetPrice" placeholder="27元" /></label><label>支撑价格<input name="supportPrice" placeholder="22元" /></label><label class="wide">投顾/执业信息<input name="advisor" placeholder="姓名 / 执业编号" /></label><label class="wide">入选理由<textarea name="rationale" placeholder="粘贴完整入选理由"></textarea></label><label class="full">风险提示/原文备注<textarea name="disclaimer" placeholder="粘贴服务方风险提示或原文说明"></textarea></label><button type="submit">保存推荐</button><span id="message"></span></form></section>
+<section class="panel"><h2>推荐跟踪与回填</h2><p>手数按 A 股 1 手 = 100 股。盈亏只按手工回填的买入价、卖出价和卖出手数计算，未计佣金、印花税和持仓浮盈。</p><div class="table-wrap" id="records"></div></section></main>
+<script>
+let status=null;
+const esc=v=>String(v??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
+const num=(v,d=2)=>v==null||!Number.isFinite(Number(v))?'—':Number(v).toFixed(d);
+async function api(path,body){const r=await fetch(path,body?{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}:undefined);const d=await r.json();if(!r.ok)throw new Error(d.error||'请求失败');return d}
+function inp(r,field,type,placeholder){return '<input data-id="'+r.id+'" data-field="'+field+'" type="'+type+'" value="'+esc(r[field])+'" placeholder="'+placeholder+'" />'}
+function render(){const s=status;document.querySelector('[name=recommendationDate]').value=s.today;const list=[['总推荐',s.stats.total],['今日已录入',s.stats.todayCount+' / 2'],['待买入',s.stats.pending],['持有中',s.stats.holding],['已卖出',s.stats.sold]];document.querySelector('#stats').innerHTML=list.map(x=>'<div class="stat"><span>'+x[0]+'</span><b>'+x[1]+'</b></div>').join('');if(!s.records.length){document.querySelector('#records').innerHTML='<div class="empty">还没有推荐记录。先从上方录入今天的两只股票。</div>';return}document.querySelector('#records').innerHTML='<table><thead><tr><th>入选</th><th>股票</th><th>来源</th><th>关注/目标/支撑</th><th>建议仓位</th><th>状态</th><th>买入回填</th><th>卖出回填</th><th>已实现盈亏</th><th>理由</th><th>保存</th></tr></thead><tbody>'+s.records.map(r=>{const p=r.realizedPnl==null?'—':'<span class="'+(Number(r.realizedPnl)>=0?'pnl-pos':'pnl-neg')+'">'+num(r.realizedPnl)+' ('+num(r.realizedReturn)+'%)</span>';return '<tr><td>'+esc(r.recommendationDate)+'</td><td><b>'+esc(r.code)+'</b><br>'+esc(r.name)+'</td><td>'+esc(r.source)+'</td><td>关注 '+esc(r.focusPrice||'—')+'<br>目标 '+esc(r.targetPrice||'—')+'<br>支撑 '+esc(r.supportPrice||'—')+'</td><td>'+esc(r.suggestedPosition||'—')+'</td><td><span class="status '+esc(r.status)+'">'+esc(r.status)+'</span><br><small>持有 '+r.heldShares+' 股</small></td><td><div class="fill">'+inp(r,'buyPrice','number','价格')+inp(r,'buyLots','number','手数')+inp(r,'buyDate','date','')+'</div></td><td><div class="fill">'+inp(r,'sellPrice','number','价格')+inp(r,'sellLots','number','手数')+inp(r,'sellDate','date','')+'</div></td><td>'+p+'</td><td class="rationale">'+esc(r.rationale||'—')+'</td><td><button class="save" data-save="'+r.id+'">保存回填</button></td></tr>'}).join('')+'</tbody></table>';document.querySelectorAll('[data-save]').forEach(b=>b.addEventListener('click',async()=>{const id=b.dataset.save,fields={};document.querySelectorAll('[data-id="'+id+'"]').forEach(i=>fields[i.dataset.field]=i.value);try{b.disabled=true;b.textContent='保存中';await api('/api/recommendations/'+id,fields);await refresh('回填已保存')}catch(e){alert(e.message||String(e));b.disabled=false;b.textContent='保存回填'}}))}
+async function refresh(message){status=await api('/api/recommendations');render();document.querySelector('#message').textContent=message||''}
+document.querySelector('#createForm').addEventListener('submit',async e=>{e.preventDefault();try{await api('/api/recommendations',Object.fromEntries(new FormData(e.currentTarget).entries()));e.currentTarget.reset();await refresh('推荐已保存')}catch(err){alert(err.message||String(err))}});
+refresh();setInterval(refresh,30*60*1000);
+</script></body></html>`;
+}
+
+function recommendationsTrackerHtml() {
+  return `<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Recommendation Journal</title>
+<style>
+:root{--ink:#17212b;--muted:#64748b;--line:#d8e0e8;--blue:#155e75;--orange:#b45309;--green:#166534;--red:#b42318}*{box-sizing:border-box}body{margin:0;color:var(--ink);background:linear-gradient(135deg,#e6f1f5,#f9f5ed 50%,#eef4eb);font-family:ui-serif,Georgia,"Noto Serif SC",serif}header,main{max-width:1440px;margin:auto;padding-left:clamp(18px,4vw,54px);padding-right:clamp(18px,4vw,54px)}header{padding-top:34px;padding-bottom:18px}.hero{display:flex;justify-content:space-between;gap:18px;align-items:end}h1{margin:0;font-size:clamp(30px,4vw,46px);letter-spacing:-.04em}p{color:var(--muted)}a{color:var(--blue);font-weight:700}.stats{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}.stat,.panel{background:#ffffffdc;border:1px solid var(--line);border-radius:16px;box-shadow:0 10px 30px #18324a0b}.stat{padding:14px}.stat b{display:block;font-size:24px;margin-top:4px}.stat span{color:var(--muted);font-size:13px}main{display:grid;gap:18px;padding-bottom:42px}.panel{padding:18px}.panel h2{margin:0 0 5px;font-size:21px}textarea{width:100%;min-height:230px;resize:vertical;border:1px solid #cbd5df;border-radius:11px;background:#fff;padding:12px;font:inherit;color:var(--ink)}button{border:0;border-radius:999px;padding:9px 13px;background:var(--blue);color:#fff;font:inherit;font-weight:700;cursor:pointer}.sell{background:var(--orange)}.table-wrap{overflow-x:auto;border:1px solid var(--line);border-radius:12px}.table-wrap table{min-width:1250px}table{width:100%;border-collapse:collapse;font-size:14px}th{background:#e8f1f5;text-align:left;white-space:nowrap}td,th{padding:9px 8px;border-bottom:1px solid var(--line);vertical-align:top}tr:last-child td{border:0}.status{display:inline-block;padding:3px 8px;border-radius:999px;background:#e5e7eb;white-space:nowrap;font-size:12px;font-weight:700}.status.持有中{background:#dcfce7;color:var(--green)}.status.已卖出{background:#dbeafe;color:#1d4ed8}.status.部分卖出{background:#fef3c7;color:#92400e}.fill{display:grid;grid-template-columns:68px 58px 110px;gap:4px}.fill input{width:100%;min-width:0;border:1px solid #cbd5df;border-radius:7px;padding:6px;font:inherit}.logged{font-size:11px;color:var(--muted);margin-top:5px}.pnl-pos{color:var(--green);font-weight:700}.pnl-neg{color:var(--red);font-weight:700}.empty{padding:32px;color:var(--muted);text-align:center}#message{margin-left:10px;color:var(--muted);font-weight:700}@media(max-width:800px){.stats{grid-template-columns:repeat(2,1fr)}.hero{display:block}}
+</style></head><body>
+<header><div class="hero"><div><h1>Recommendation Journal</h1><p>第三方推荐独立跟踪账本。回填仅记录实际成交，不构成投资建议。</p></div><a href="/">返回交易平台</a></div></header>
+<main><div class="stats" id="stats"></div>
+<section class="panel"><h2>粘贴推荐原文</h2><p>一次可粘贴当天多条“【龙头掘金】教学案例”文本，系统自动提取股票、价格区间、建议仓位和目标/支撑价格。</p><textarea id="rawText" placeholder="粘贴完整推荐文本，例如：&#10;【龙头掘金】教学案例&#10;入选时间：7.20&#10;股票代码：601225&#10;股票名称：陕西煤业&#10;..."></textarea><p><button id="importButton">解析并保存推荐</button><span id="message"></span></p></section>
+<section class="panel"><h2>Short Hold V2 当日分数查询</h2><p>输入股票代码，查询现有 V2 最新信号日的三模型融合估计分与横截面排名；只读查询，不影响推荐账本或交易清单。</p><p><input id="scoreCode" maxlength="8" placeholder="例如 601225 或 SH601225"><button id="scoreButton">查询当日分数</button></p><p id="scoreResult"></p></section>
+<section class="panel"><h2>推荐跟踪与回填</h2><p>1 手 = 100 股。买入、卖出各自独立保存；每次保存自动以点击当天作为成交日期并写入回填日志。</p><div class="table-wrap" id="records"></div></section>
+</main><script>
+let status=null;
+const esc=v=>String(v??'').replace(/[&<>"']/g,x=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[x]));
+const num=(v,d=2)=>v==null||!Number.isFinite(Number(v))?'—':Number(v).toFixed(d);
+const saved=v=>v?'回填于 '+new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit'}).format(new Date(v)):'尚未保存';
+async function api(path,body){const r=await fetch(path,body?{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body)}:undefined);const d=await r.json();if(!r.ok)throw new Error(d.error||'请求失败');return d}
+function input(r,field,type,holder){return '<input data-id="'+r.id+'" data-field="'+field+'" type="'+type+'" value="'+esc(r[field])+'" placeholder="'+holder+'">'}
+function fill(r,side){const cap=side==='buy'?'买入':'卖出';return '<div class="fill">'+input(r,side+'Price','number','价格')+input(r,side+'Lots','number','手数')+'</div><div class="logged">'+saved(r[side+'SavedAt'])+'</div><button class="'+(side==='sell'?'sell':'')+'" data-save="'+r.id+'" data-side="'+side+'">保存'+cap+'回填</button>'}
+function render(){const s=status;const stats=[['总推荐',s.stats.total],['今日录入',s.stats.todayCount+' / 2'],['待买入',s.stats.pending],['持有中',s.stats.holding],['已卖出',s.stats.sold]];document.querySelector('#stats').innerHTML=stats.map(x=>'<div class="stat"><span>'+x[0]+'</span><b>'+x[1]+'</b></div>').join('');if(!s.records.length){document.querySelector('#records').innerHTML='<div class="empty">还没有记录。</div>';return}document.querySelector('#records').innerHTML='<table><thead><tr><th>入选日期</th><th>股票代码</th><th>股票名称</th><th>来源</th><th>关注价格</th><th>目标价格</th><th>支撑价格</th><th>建议仓位</th><th>状态</th><th>买入回填</th><th>卖出回填</th><th>已实现盈亏</th></tr></thead><tbody>'+s.records.map(r=>{const pnl=r.realizedPnl==null?'—':'<span class="'+(Number(r.realizedPnl)>=0?'pnl-pos':'pnl-neg')+'">'+num(r.realizedPnl)+' ('+num(r.realizedReturn)+'%)</span>';return '<tr><td>'+esc(r.recommendationDate)+'</td><td><b>'+esc(r.code)+'</b></td><td>'+esc(r.name)+'</td><td>'+esc(r.source)+'</td><td>'+esc(r.focusPrice||'—')+'</td><td>'+esc(r.targetPrice||'—')+'</td><td>'+esc(r.supportPrice||'—')+'</td><td>'+esc(r.suggestedPosition||'—')+'</td><td><span class="status '+esc(r.status)+'">'+esc(r.status)+'</span><br><small>持有 '+r.heldShares+' 股</small></td><td>'+fill(r,'buy')+'</td><td>'+fill(r,'sell')+'</td><td>'+pnl+'</td></tr>'}).join('')+'</tbody></table>';document.querySelectorAll('[data-save]').forEach(b=>b.addEventListener('click',async()=>{const id=b.dataset.save,side=b.dataset.side,fields={};document.querySelectorAll('[data-id="'+id+'"]').forEach(i=>fields[i.dataset.field]=i.value);try{b.disabled=true;b.textContent='保存中';await api('/api/recommendations/'+id+'/'+side+'-fill',fields);await refresh(side==='buy'?'买入回填已保存':'卖出回填已保存')}catch(e){alert(e.message||String(e));b.disabled=false;b.textContent='保存回填'}}))}
+async function refresh(message){status=await api('/api/recommendations');render();document.querySelector('#message').textContent=message||''}
+document.querySelector('#importButton').addEventListener('click',async()=>{const text=document.querySelector('#rawText').value.trim();if(!text)return alert('请先粘贴推荐原文');try{await api('/api/recommendations/import',{rawText:text});document.querySelector('#rawText').value='';await refresh('推荐已解析并保存')}catch(e){alert(e.message||String(e))}});
+document.querySelector('#scoreButton').addEventListener('click',async()=>{const code=document.querySelector('#scoreCode').value.trim(),out=document.querySelector('#scoreResult');if(!code)return alert('请输入股票代码');out.textContent='查询中...';try{const r=await api('/api/recommendations/short-hold-v2-score',{code});out.textContent=r.found?'信号日 '+r.signalDate+' ｜ V2 融合估计分 '+Number(r.score).toFixed(6)+' ｜ 排名 '+r.rank+' / '+r.universeSize+' ｜ 前 '+Number(r.percentile).toFixed(2)+'%':'信号日 '+r.signalDate+' 未在 V2 候选股票池中找到 '+r.code}catch(e){out.textContent='查询失败：'+(e.message||String(e))}});
+refresh();setInterval(refresh,30*60*1000);
+</script></body></html>`;
 }
 
 function send(res: import("node:http").ServerResponse, status: number, body: unknown, type = "application/json") {
@@ -1195,8 +2029,97 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url || "/", "http://localhost");
     if (req.method === "GET" && url.pathname === "/") return send(res, 200, html(), "text/html");
     if (req.method === "GET" && url.pathname === "/short-hold") return send(res, 200, shortHoldHtml(), "text/html");
+    if (req.method === "GET" && url.pathname === "/short-hold-v3") return send(res, 200, shortHoldHtml("v3"), "text/html");
+    if (req.method === "GET" && url.pathname === "/short-hold-v5") return send(res, 200, shortHoldHtml("v5"), "text/html");
+    if (req.method === "GET" && url.pathname === "/naked-k") return send(res, 200, nakedKHtml(), "text/html");
+    if (req.method === "GET" && url.pathname === "/naked-k-model") return send(res, 200, nakedKModelHtml(), "text/html");
+    if (req.method === "GET" && url.pathname === "/naked-k-live") return send(res, 200, nakedKLiveHtml(), "text/html");
+    if (req.method === "GET" && url.pathname === "/recommendations") return send(res, 200, recommendationsTrackerHtml(), "text/html");
     if (req.method === "GET" && url.pathname === "/api/status") return send(res, 200, loadStatus());
+    if (req.method === "GET" && url.pathname === "/api/naked-k/status") return send(res, 200, loadNakedKStatus());
+    if (req.method === "GET" && url.pathname === "/api/naked-k-live/status") return send(res, 200, loadNakedKLiveStatus());
+    if (req.method === "POST" && url.pathname === "/api/naked-k-live/open") {
+      return send(res, 201, recordNakedKLiveOpen(await parseJsonBody(req)));
+    }
+    if (req.method === "POST" && url.pathname === "/api/naked-k-live/decisions") {
+      return send(res, 201, recordNakedKLiveDecision(await parseJsonBody(req)));
+    }
+    const nakedKIgnoreMatch = url.pathname.match(/^\/api\/naked-k-live\/decisions\/([^/]+)\/ignore$/);
+    if (req.method === "POST" && nakedKIgnoreMatch) {
+      return send(res, 200, ignoreNakedKLiveDecision(decodeURIComponent(nakedKIgnoreMatch[1])));
+    }
+    if (req.method === "POST" && url.pathname === "/api/naked-k-live/fills") {
+      return send(res, 201, recordNakedKLiveFill(await parseJsonBody(req)));
+    }
+    if (req.method === "GET" && url.pathname === "/api/naked-k-model/status") return send(res, 200, loadNakedKModelStatus());
+    if (req.method === "POST" && url.pathname === "/api/naked-k-model/decisions") {
+      return send(res, 201, saveNakedKModelDecision(await parseJsonBody(req)));
+    }
+    if (req.method === "POST" && url.pathname === "/api/naked-k/fills") {
+      return send(res, 201, recordNakedKFill(await parseJsonBody(req)));
+    }
+    if (req.method === "GET" && url.pathname === "/api/recommendations") return send(res, 200, recommendationStatus());
+    if (req.method === "POST" && url.pathname === "/api/recommendations") {
+      const records = readRecommendationRecords();
+      const record = recommendationFromBody(await parseJsonBody(req));
+      records.push(record);
+      writeRecommendationRecords(records);
+      return send(res, 201, { record: recommendationView(record) });
+    }
+    if (req.method === "POST" && url.pathname === "/api/recommendations/import") {
+      const body = await parseJsonBody(req);
+      const records = parseRecommendationText(cleanText(body.rawText));
+      const existing = readRecommendationRecords();
+      const keys = new Set(
+        existing.map((record) => `${record.source}|${record.recommendationDate}|${record.code}`),
+      );
+      const additions = records.filter((record) => {
+        const key = `${record.source}|${record.recommendationDate}|${record.code}`;
+        if (keys.has(key)) return false;
+        keys.add(key);
+        return true;
+      });
+      writeRecommendationRecords([...existing, ...additions]);
+      return send(res, 201, {
+        imported: additions.length,
+        skippedDuplicates: records.length - additions.length,
+        records: additions.map(recommendationView),
+      });
+    }
+    if (req.method === "POST" && url.pathname === "/api/recommendations/short-hold-v2-score") {
+      const body = await parseJsonBody(req);
+      return send(res, 200, await lookupShortHoldV2Score(cleanText(body.code)));
+    }
+    if (req.method === "POST" && url.pathname.match(/^\/api\/recommendations\/[^/]+\/(buy|sell)-fill$/)) {
+      const [, id, side] = url.pathname.match(/^\/api\/recommendations\/([^/]+)\/(buy|sell)-fill$/) || [];
+      if (!id || (side !== "buy" && side !== "sell")) return send(res, 404, { error: "invalid fill route" });
+      return send(res, 200, { record: updateRecommendationFill(id, side, await parseJsonBody(req)) });
+    }
+    if (req.method === "POST" && url.pathname.startsWith("/api/recommendations/")) {
+      const id = url.pathname.slice("/api/recommendations/".length);
+      if (!id) return send(res, 404, { error: "recommendation id is required" });
+      const records = readRecommendationRecords();
+      const index = records.findIndex((record) => record.id === id);
+      if (index < 0) return send(res, 404, { error: "recommendation not found" });
+      const record = recommendationFromBody(await parseJsonBody(req), records[index]);
+      records[index] = record;
+      writeRecommendationRecords(records);
+      return send(res, 200, { record: recommendationView(record) });
+    }
     if (req.method === "GET" && url.pathname === "/api/short-hold/status") return send(res, 200, loadShortHoldStatus());
+    if (req.method === "POST" && url.pathname === "/api/short-hold/v2-score") {
+      const body = await parseJsonBody(req);
+      return send(res, 200, await lookupShortHoldV2Score(cleanText(body.code)));
+    }
+    if (req.method === "GET" && url.pathname === "/api/short-hold-v3/status") return send(res, 200, loadShortHoldStatus("v3"));
+    if (req.method === "GET" && url.pathname === "/api/short-hold-v5/status") return send(res, 200, loadShortHoldStatus("v5"));
+    if (req.method === "POST" && url.pathname === "/api/short-hold-v5/v5-score") {
+      const body = await parseJsonBody(req);
+      return send(res, 200, await lookupShortHoldV5Score(cleanText(body.code)));
+    }
+    if (req.method === "GET" && url.pathname === "/api/short-hold-v3/research/latest") {
+      return send(res, 200, loadLatestShortHoldV3ResearchReport());
+    }
     if (req.method === "POST" && url.pathname === "/api/save-fills") {
       const body = await parseJsonBody(req);
       const executionDate = validateDate(body.executionDate);
@@ -1209,11 +2132,21 @@ const server = createServer(async (req, res) => {
       writeCsv(fillPath, rows);
       return send(res, 200, { path: fillPath, nRows: rows.length });
     }
-    if (req.method === "POST" && url.pathname === "/api/short-hold/save-fills") {
+    if (req.method === "POST" && (
+      url.pathname === "/api/short-hold/save-fills" ||
+      url.pathname === "/api/short-hold-v3/save-fills" ||
+      url.pathname === "/api/short-hold-v5/save-fills"
+    )) {
       const body = await parseJsonBody(req);
       const executionDate = validateDate(body.executionDate);
       const env = parseEnv(ENV_PATH);
-      const fillDir = env.SHORT_HOLD_FILL_DIR || resolve(OPS_HOME, "short_hold_fills");
+      const isV3 = url.pathname.startsWith("/api/short-hold-v3/");
+      const isV5 = url.pathname.startsWith("/api/short-hold-v5/");
+      const fillDir = isV5
+        ? env.SHORT_HOLD_V5_FILL_DIR || resolve(OPS_HOME, "short_hold_v5_fills")
+        : isV3
+        ? env.SHORT_HOLD_V3_FILL_DIR || resolve(OPS_HOME, "short_hold_v3_fills")
+        : env.SHORT_HOLD_FILL_DIR || resolve(OPS_HOME, "short_hold_fills");
       mkdirSync(fillDir, { recursive: true });
       const fillPath = resolve(fillDir, `short_hold_fill_template_${executionDate}.csv`);
       const rows = Array.isArray(body.rows) ? body.rows : [];
@@ -1221,14 +2154,40 @@ const server = createServer(async (req, res) => {
       writeCsv(fillPath, rows);
       return send(res, 200, { path: fillPath, nRows: rows.length });
     }
-    if (req.method === "POST" && url.pathname.startsWith("/api/short-hold/run/")) {
+    if (
+      req.method === "POST" &&
+      (
+        url.pathname.startsWith("/api/short-hold/run/") ||
+        url.pathname.startsWith("/api/short-hold-v3/run/") ||
+        url.pathname.startsWith("/api/short-hold-v5/run/")
+      )
+    ) {
+      const isV3 = url.pathname.startsWith("/api/short-hold-v3/");
+      const isV5 = url.pathname.startsWith("/api/short-hold-v5/");
       const action = url.pathname.split("/").pop() || "";
       const body = await parseJsonBody(req);
       let job: Job;
-      if (action === "prepare-short-hold-orders") job = startJob(action, OPS_HOME, "bash", ["bin/prepare_short_hold_orders.sh"]);
-      else if (action === "short-hold-apply-fills") job = startJob(action, OPS_HOME, "bash", ["bin/short_hold_apply_fills.sh", validateDate(body.executionDate)]);
-      else if (action === "short-hold-daily-snapshot") job = startJob(action, OPS_HOME, "bash", ["bin/short_hold_daily_snapshot.sh", validateDate(body.executionDate)]);
-      else if (action === "generate-and-send-short-hold-snapshot") job = startJob(action, OPS_HOME, "bash", ["bin/generate_and_send_short_hold_snapshot.sh", validateDate(body.executionDate)]);
+      if (action === "prepare-short-hold-orders") {
+        job = startJob(action, OPS_HOME, "bash", [isV5 ? "bin/prepare_short_hold_v5_orders.sh" : isV3 ? "bin/prepare_short_hold_v3_orders.sh" : "bin/prepare_short_hold_orders.sh"]);
+      }
+      else if (action === "short-hold-apply-fills") {
+        job = startJob(action, OPS_HOME, "bash", [
+          isV5 ? "bin/short_hold_v5_apply_fills.sh" : isV3 ? "bin/short_hold_v3_apply_fills.sh" : "bin/short_hold_apply_fills.sh",
+          validateDate(body.executionDate),
+        ]);
+      }
+      else if (action === "short-hold-daily-snapshot") {
+        job = startJob(action, OPS_HOME, "bash", [
+          isV5 ? "bin/short_hold_v5_daily_snapshot.sh" : isV3 ? "bin/short_hold_v3_daily_snapshot.sh" : "bin/short_hold_daily_snapshot.sh",
+          validateDate(body.executionDate),
+        ]);
+      }
+      else if (action === "generate-and-send-short-hold-snapshot") {
+        job = startJob(action, OPS_HOME, "bash", [
+          isV5 ? "bin/generate_and_send_short_hold_v5_snapshot.sh" : isV3 ? "bin/generate_and_send_short_hold_v3_snapshot.sh" : "bin/generate_and_send_short_hold_snapshot.sh",
+          validateDate(body.executionDate),
+        ]);
+      }
       else return send(res, 404, { error: `unknown short-hold action: ${action}` });
       return send(res, 200, job);
     }

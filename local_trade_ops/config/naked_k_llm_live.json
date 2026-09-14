@@ -1,0 +1,21 @@
+{
+  "strategyId": "naked_k_llm_live_frozen_v1",
+  "strategyVersion": "1.0.0",
+  "initialCapital": 50000,
+  "openBreadthThreshold": 0.37,
+  "watchlistSize": 3,
+  "firstIntradayDecision": "09:35",
+  "lastBuyDecision": "14:50",
+  "lastSellDecision": "14:55",
+  "decisionIntervalMinutes": 5,
+  "allowSameDaySwitch": true,
+  "blockSameDayRebuy": true,
+  "singlePosition": true,
+  "allowAddPosition": false,
+  "costs": {
+    "buyRate": 0.0003,
+    "sellRate": 0.0008,
+    "minimumFee": 5,
+    "lotSize": 100
+  }
+}

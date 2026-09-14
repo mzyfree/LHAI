@@ -13,6 +13,24 @@ Open:
 http://127.0.0.1:8787
 ```
 
+The frozen naked-K LLM live assistant is available at:
+
+```text
+http://127.0.0.1:8787/naked-k-live
+```
+
+It uses an isolated JSON ledger and state directory, defaults to CNY 50,000,
+and never sends broker orders. The 09:25 gate and fixed Top3 are followed by
+state-aware five-minute decisions; only manual fill submission changes the
+account. Configure `TUSHARE_TOKEN` and `DEEPSEEK_API_KEY` in
+`config/env.local` before enabling daily automation. See
+`docs/naked_k_llm_live_service.md` for the frozen behavior and safety rules.
+
+The live runner uses Eastmoney 5-minute bars first, aggregates Tencent live
+minute quotes when Eastmoney is unavailable, and uses TuShare minute history
+as the final fallback. Missing LLM credentials or market data never creates a
+trade recommendation.
+
 The service wraps the existing, audited scripts:
 
 - `paper_trading_system/bin/update_data.sh`
