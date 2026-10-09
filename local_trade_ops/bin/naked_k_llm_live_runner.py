@@ -25,7 +25,7 @@ API_BASE = os.environ.get("NAKED_K_LIVE_API", "http://127.0.0.1:8787").rstrip("/
 sys.path.insert(0, str(OPS_HOME / "bin"))
 import backtest_naked_k_qwen as llm  # noqa: E402
 from backtest_naked_k_qwen import prompt, qwen  # noqa: E402
-from backtest_naked_k_deepseek_intraday import compact_bars, intraday_facts  # noqa: E402
+from backtest_naked_k_deepseek_intraday import board_allowed, compact_bars, intraday_facts  # noqa: E402
 import naked_k_daily_runner as daily  # noqa: E402
 
 
@@ -126,14 +126,12 @@ def limit_threshold(code: str) -> float:
 def frozen_open_pool(rows: list[dict]) -> list[dict]:
     result = []
     for row in rows:
+        if not board_allowed(str(row.get("ts_code", ""))):
+            continue
         gap = row.get("open_gap")
-        prior_20d = row.get("prior_return_20d")
-        limit_memory = row.get("prior_limit_count60")
-        if gap is None or prior_20d is None or limit_memory is None:
+        if gap is None:
             continue
         if float(gap) > 0.05 or float(gap) >= limit_threshold(str(row.get("ts_code", ""))):
-            continue
-        if float(prior_20d) > 0.25 or int(limit_memory) < 1:
             continue
         result.append(row)
     return result
@@ -250,7 +248,8 @@ def tencent_5m(code: str, date: str) -> pd.DataFrame:
     clock = minute.trade_time.dt.hour * 60 + minute.trade_time.dt.minute
     continuous_session = clock.between(9 * 60 + 30, 11 * 60 + 30) | clock.between(13 * 60, 15 * 60)
     minute = minute[continuous_session].copy()
-    minute["vol"] = minute.cum_vol.diff().fillna(minute.cum_vol).clip(lower=0)
+    # Tencent reports cumulative volume in hands while amount is in yuan.
+    minute["vol"] = minute.cum_vol.diff().fillna(minute.cum_vol).clip(lower=0) * 100
     minute["amount"] = minute.cum_amount.diff().fillna(minute.cum_amount).clip(lower=0)
     clock = minute.trade_time.dt.hour * 60 + minute.trade_time.dt.minute
     session_minute = np.where(clock <= 11 * 60 + 30, clock - 9 * 60 - 30, 120 + clock - 13 * 60)
@@ -289,7 +288,7 @@ def eastmoney_5m(code: str, date: str) -> pd.DataFrame:
                 cells = line.split(",")
                 if len(cells) >= 7:
                     rows.append({"trade_time": cells[0], "open": cells[1], "close": cells[2], "high": cells[3],
-                                 "low": cells[4], "vol": cells[5], "amount": cells[6]})
+                                 "low": cells[4], "vol": float(cells[5]) * 100, "amount": cells[6]})
             return normalize_5m(pd.DataFrame(rows), "eastmoney_5m")
         except Exception as exc:
             errors.append(f"eastmoney:{exc}")
@@ -330,10 +329,18 @@ def phase_intraday(date: str, at: str | None) -> dict:
                 "intradayReturn": float(visible.iloc[-1].close / visible.iloc[0].open - 1),
             }
             base["facts"] = intraday_facts(frame, cutoff, float(context.get("stock_vs_sector_open") or 0), base)
+            base["evidenceChecklist"] = {
+                "hotSector": base.get("industry") in hot_sectors,
+                **{
+                    field: base["facts"].get(field) is True
+                    for field in ["strongerThanSector", "aboveVwap", "threeLowsNonDecreasing", "volumeBreakout", "dailySupport"]
+                },
+            }
+            base["evidenceCount"] = sum(base["evidenceChecklist"].values())
             base["bars"] = compact_bars(frame, cutoff)
             candidates.append(base)
         schema = '{"action":"buy|wait","stock":"代码或null","confidence":0到1,"reasons":["..."],"risks":["..."]}'
-        task = "空仓时比较固定Top3。热点、strongerThanSector、aboveVwap、threeLowsNonDecreasing、volumeBreakout、dailySupport至少4项为真才可buy；null和false不计。不得选择输入外股票。"
+        task = """空仓时比较固定Top3。代码已经在每只股票的evidenceChecklist与evidenceCount中完成六项证据计数，必须直接引用evidenceCount，禁止自行重算。evidenceCount少于4必须wait；达到4仅代表具备买入资格，不等于必须buy，仍可因动能、量价质量或追高风险wait。每只股票必须准确写明“满足evidenceCount/6项”；若达到4却wait，必须明确说明额外拒绝理由，禁止写成“未达到4项”。不得选择输入外股票。"""
         decision, usage = qwen(prompt(task, schema, {"dateTime": cutoff.isoformat(), "hotSectors": hot_sectors, "candidates": candidates}), key, "deepseek-chat")
         action = decision.get("action", "wait")
         code = decision.get("stock") if action == "buy" else None
@@ -381,18 +388,22 @@ def phase_intraday(date: str, at: str | None) -> dict:
                  "consecutiveWeakBarsWithRisingVolume": bool(len(tail) == 3 and (tail.close < tail.open).all() and tail.vol.is_monotonic_increasing),
                  "hotspotRetreated": bool(entry_industry and entry_industry not in hot_sectors)}
         payload = {"dateTime": cutoff.isoformat(), "position": {**position, "facts": facts, "bars": compact_bars(frame, cutoff)}}
-        decision, usage = qwen(prompt("只判断当前T+1持仓继续持有或卖出。卖出必须引用position.facts中的明确走弱证据。", '{"action":"hold|sell","stock":"持仓代码","confidence":0到1,"reasons":["..."],"risks":["..."]}', payload), key, "deepseek-chat")
+        decision, usage = qwen(prompt("只判断当前T+1持仓继续持有或卖出。卖出必须引用position.facts中的明确走弱证据。首根5分钟K线只有aboveVwap=false而其他风险事实均不为true时必须hold，等待下一根K线确认。", '{"action":"hold|sell","stock":"持仓代码","confidence":0到1,"reasons":["..."],"risks":["..."]}', payload), key, "deepseek-chat")
         action = decision.get("action", "hold")
         code, name, price = position["code"], position["name"], float(visible.iloc[-1].close)
         hard_block, evidence = None, None
         if action == "sell" and decision.get("stock") != code:
             action, hard_block = "hold", "sell_stock_mismatch"
+        position_facts, visible_bar_count = facts, len(visible)
+    if not status["account"].get("position"):
+        position_facts, visible_bar_count = None, None
     result = post("/api/naked-k-live/decisions", {
         "id": f"intraday-{date}-{cutoff.strftime('%H%M')}", "date": date, "generatedAt": datetime.now().astimezone().isoformat(),
         "dataCutoff": cutoff.tz_localize("Asia/Shanghai").isoformat() if cutoff.tzinfo is None else cutoff.isoformat(),
         "action": action, "code": code, "name": name, "referencePrice": price,
         "confidence": decision.get("confidence"), "evidenceCount": evidence,
         "reasons": decision.get("reasons", []), "risks": decision.get("risks", []), "hardBlock": hard_block,
+        "positionFacts": position_facts, "visibleBarCount": visible_bar_count,
     })
     update_system(
         scheduler={"status": "running", "lastPhase": "intraday", "lastSuccessAt": datetime.now().astimezone().isoformat()},

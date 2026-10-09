@@ -6,11 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import time
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+import requests
 
 import backtest_naked_k_qwen as llm
 from backtest_naked_k_qwen import prompt, qwen, valid_day
@@ -19,6 +21,22 @@ from backtest_auction_hot_sector import add_point_in_time_features, limit_thresh
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUT = ROOT.parent / "reports" / "naked_k_deepseek_intraday_3d"
+
+
+def env_enabled(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def board_allowed(instrument: str) -> bool:
+    digits = "".join(character for character in str(instrument) if character.isdigit())[:6]
+    if digits.startswith(("688", "689")):
+        return env_enabled("NAKED_K_ENABLE_STAR_MARKET")
+    if digits.startswith(("300", "301", "302")):
+        return env_enabled("NAKED_K_ENABLE_CHINEXT")
+    return True
 
 
 def ts_code(instrument: str) -> str:
@@ -45,13 +63,86 @@ def download_5m(bs, instrument: str, date: pd.Timestamp, cache: Path) -> pd.Data
     if target.exists():
         frame = pd.read_csv(target)
     else:
-        result = bs.query_history_k_data_plus(
-            baostock_code(instrument), "date,time,code,open,high,low,close,volume,amount,adjustflag",
-            start_date=f"{date:%Y-%m-%d}", end_date=f"{date:%Y-%m-%d}",
-            frequency="5", adjustflag="3",
-        )
-        frame = baostock_frame(result)
+        frame = pd.DataFrame()
+        if bs is not None:
+            try:
+                result = bs.query_history_k_data_plus(
+                    baostock_code(instrument), "date,time,code,open,high,low,close,volume,amount,adjustflag",
+                    start_date=f"{date:%Y-%m-%d}", end_date=f"{date:%Y-%m-%d}",
+                    frequency="5", adjustflag="3",
+                )
+                frame = baostock_frame(result)
+            except Exception:
+                frame = pd.DataFrame()
         if frame.empty:
+            value = str(instrument).lower()
+            symbol = value[:2] + value[2:]
+            try:
+                response = requests.get(
+                    "https://quotes.sina.cn/cn/api/jsonp_v2.php/var%20_a=/CN_MarketDataService.getKLineData",
+                    params={"symbol": symbol, "scale": 5, "ma": "no", "datalen": 1023},
+                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"},
+                    timeout=15,
+                )
+                response.raise_for_status()
+                match = re.search(r"var _a=\((\[.*\])\);", response.text, re.S)
+                rows = json.loads(match.group(1)) if match else []
+                frame = pd.DataFrame(rows)
+                if not frame.empty:
+                    frame = frame.rename(columns={"day": "trade_time"})
+                    frame["trade_time"] = pd.to_datetime(frame["trade_time"], errors="coerce")
+                    frame = frame[frame["trade_time"].dt.normalize().eq(date.normalize())]
+                    frame = frame.rename(columns={"volume": "vol"})
+            except Exception:
+                frame = pd.DataFrame()
+        if frame.empty:
+            symbol = ts_code(instrument).split(".")[0]
+            exchange = ts_code(instrument).split(".")[1]
+            secid = f"1.{symbol}" if exchange == "SH" else f"0.{symbol}"
+            compact_date = date.strftime("%Y%m%d")
+            try:
+                response = requests.get(
+                    "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+                    params={
+                        "secid": secid, "klt": 5, "fqt": 1,
+                        "beg": compact_date, "end": compact_date,
+                        "fields1": "f1,f2,f3,f4,f5,f6",
+                        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+                    },
+                    headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+                    timeout=15,
+                )
+                response.raise_for_status()
+                klines = (response.json().get("data") or {}).get("klines") or []
+                rows = []
+                for line in klines:
+                    cells = line.split(",")
+                    if len(cells) >= 7:
+                        rows.append({
+                            "trade_time": cells[0], "open": cells[1], "close": cells[2],
+                            "high": cells[3], "low": cells[4],
+                            "volume": float(cells[5]) * 100, "amount": cells[6],
+                        })
+                frame = pd.DataFrame(rows)
+            except Exception:
+                frame = pd.DataFrame()
+        if frame.empty:
+            import tushare as ts
+
+            token = os.environ.get("TUSHARE_TOKEN", "").strip()
+            if not token:
+                raise RuntimeError("BaoStock失败且缺少TUSHARE_TOKEN")
+            frame = ts.pro_bar(
+                api=ts.pro_api(token), ts_code=ts_code(instrument), freq="5min",
+                start_date=f"{date:%Y-%m-%d} 09:30:00",
+                end_date=f"{date:%Y-%m-%d} 15:00:00",
+            )
+            if frame is not None and not frame.empty:
+                frame = frame.rename(columns={"vol": "volume"})
+                # TuShare minute volume is in lots and amount is in CNY thousands.
+                frame["volume"] = pd.to_numeric(frame["volume"], errors="coerce") * 100
+                frame["amount"] = pd.to_numeric(frame["amount"], errors="coerce") * 1000
+        if frame is None or frame.empty:
             raise RuntimeError(f"no 5m data: {instrument} {date.date()}")
         frame.to_csv(target, index=False)
     if "trade_time" not in frame:
@@ -159,6 +250,7 @@ def hierarchy_universe(day: pd.DataFrame) -> tuple[dict, list[dict], pd.DataFram
     tradable = valid[
         valid.open_gap.le(.05)
         & valid.open_gap.lt(valid.instrument.map(limit_threshold))
+        & valid.instrument.map(board_allowed)
     ].copy().merge(sectors[["industry", "medianGap"]], on="industry", how="inner")
     tradable["sectorEdge"] = tradable.open_gap - tradable.medianGap
     tradable["prior_low_raw"] = tradable.prior_low / tradable.factor
@@ -326,6 +418,14 @@ def main() -> int:
                     "limitMemory60": item["prior_limit_count60"], "intradayReturn": float(last.close / visible.iloc[0].open - 1),
                 }
                 base_item["facts"] = intraday_facts(info["bars"][code], now, float(item["sectorEdge"]), base_item)
+                base_item["evidenceChecklist"] = {
+                    "hotSector": base_item.get("industry") in info["hotSectors"],
+                    **{
+                        field: base_item["facts"].get(field) is True
+                        for field in ["strongerThanSector", "aboveVwap", "threeLowsNonDecreasing", "volumeBreakout", "dailySupport"]
+                    },
+                }
+                base_item["evidenceCount"] = sum(base_item["evidenceChecklist"].values())
                 base_item["bars"] = compact_bars(info["bars"][code], now)
                 stock_context.append(base_item)
             public_position = None
@@ -352,7 +452,7 @@ def main() -> int:
             payload = {"dateTime": now.isoformat(), "marketAtOpen": info["market"], "sectorAtOpen": info["sectors"][:10], "position": public_position, "candidates": stock_context}
             schema = '{"action":"buy|sell|hold|wait","stock":"代码或null","confidence":0到1,"hotSectors":["..."],"reasons":["..."],"risks":["..."]}'
             task = """完全根据截至当前的5分钟K线与裸K事实决定操作，决策在下一根5分钟K线开盘执行。
-空仓时主动比较候选，不能仅以T+1、可能回落或数据有限作为永久wait理由。只允许按candidates[].facts计数；值为null或false一律不算满足，禁止自行估算或从单根K线推断。以下证据至少4项为true时应优先buy最强一只：所属板块位于hotSectors；strongerThanSector；aboveVwap；threeLowsNonDecreasing；volumeBreakout；dailySupport。若不足4项则wait。
+空仓时主动比较候选，不能仅以T+1、可能回落或数据有限作为永久wait理由。代码已经在candidates[].evidenceChecklist与evidenceCount中完成六项计数，必须直接引用evidenceCount，禁止自行重算。少于4项必须wait；达到4项仅代表具备买入资格，不等于必须buy。每只股票必须准确写明“满足evidenceCount/6项”；若达到4项却wait，必须给出额外拒绝理由，禁止写成“未达到4项”。
 持仓时遵守A股T+1：买入当日只能hold；次日起只允许引用position.facts。若supportBroken、aboveVwap=false且连续无法收复、consecutiveWeakBarsWithRisingVolume或hotspotRetreated形成明确风险则sell，否则hold。禁止自行计算未提供指标，普通波动不能单独触发卖出。
 必须在reasons中逐项写明满足和不满足的证据数量，并逐字引用facts字段；不得引用INPUT之外的信息。"""
             decision, usage = qwen(prompt(task, schema, payload), deepseek_key, "deepseek-chat")

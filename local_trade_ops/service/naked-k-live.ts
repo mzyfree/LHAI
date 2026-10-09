@@ -19,6 +19,7 @@ type LiveConfig = {
   blockSameDayRebuy: boolean;
   singlePosition: boolean;
   allowAddPosition: boolean;
+  blockFirstBarVwapOnlySell?: boolean;
   costs: { buyRate: number; sellRate: number; minimumFee: number; lotSize: number };
 };
 
@@ -63,6 +64,7 @@ type IntradayDecision = {
   status: "pending" | "informational" | "executed" | "ignored";
   resolvedAt?: string;
   linkedFillId?: string;
+  context?: Record<string, unknown>;
 };
 
 type Fill = {
@@ -332,15 +334,27 @@ export function recordNakedKLiveOpen(body: Record<string, unknown>) {
   const day = readDay(date);
   day.open = decision;
   writeDay(day);
-  appendLog(status === "failed" ? "error" : "info", "open_decision", decision.entryAllowed ? "今日允许寻找买点" : "今日禁止新开仓", { breadth: decision.openBreadth, top3: top3.map((item) => item.code) });
+  const threshold = config.openBreadthThreshold;
+  const breadthText = decision.openBreadth == null ? "无有效开盘广度" : `开盘广度${(decision.openBreadth * 100).toFixed(2)}%`;
+  const gapText = decision.openBreadth == null ? "" : decision.entryAllowed
+    ? `，高于门槛${((decision.openBreadth - threshold) * 100).toFixed(2)}个百分点`
+    : `，低于门槛${((threshold - decision.openBreadth) * 100).toFixed(2)}个百分点`;
+  const reasonText = decision.reasons.length ? `；原因：${decision.reasons.join("；")}` : "";
+  const logMessage = `${decision.entryAllowed ? "今日允许寻找买点" : "今日禁止新开仓"}｜${breadthText}，门槛${(threshold * 100).toFixed(2)}%${gapText}｜候选${top3.length}只${reasonText}`;
+  appendLog(status === "failed" ? "error" : "info", "open_decision", logMessage, {
+    breadth: decision.openBreadth, threshold, gap: decision.openBreadth == null ? null : decision.openBreadth - threshold,
+    entryAllowed: decision.entryAllowed, candidateCount: top3.length, top3: top3.map((item) => item.code),
+    reasons: decision.reasons, risks: decision.risks, dataCutoff: decision.dataCutoff,
+  });
   notifyNative("裸K 09:25决策", decision.entryAllowed ? `允许入场，广度${((decision.openBreadth || 0) * 100).toFixed(1)}%` : "今日禁止新开仓");
   return decision;
 }
 
 export function recordNakedKLiveDecision(body: Record<string, unknown>) {
+  const config = loadNakedKLiveConfig();
   const date = String(body.date || shanghaiDate());
   const day = readDay(date);
-  const action = String(body.action || "wait") as DecisionAction;
+  let action = String(body.action || "wait") as DecisionAction;
   if (!["wait", "buy", "hold", "sell", "blocked", "error"].includes(action)) throw new Error("无效的盘中动作");
   if (action === "buy" && !day.open?.entryAllowed) throw new Error("今日没有开仓权限，不能记录买入建议");
   const code = body.code ? normalizeCode(body.code) : null;
@@ -349,6 +363,27 @@ export function recordNakedKLiveDecision(body: Record<string, unknown>) {
   if (existing) return { decision: existing, duplicate: true };
   const pending = unresolvedDecision(day);
   if (pending && (action === "buy" || action === "sell")) throw new Error("已有待处理建议，请先成交回填或忽略");
+  const positionFacts = body.positionFacts && typeof body.positionFacts === "object"
+    ? body.positionFacts as Record<string, unknown>
+    : null;
+  const visibleBarCount = Number(body.visibleBarCount);
+  let hardBlock = body.hardBlock ? String(body.hardBlock) : null;
+  const firstBarVwapOnlySell = Boolean(
+    config.blockFirstBarVwapOnlySell
+    && action === "sell"
+    && visibleBarCount === 1
+    && positionFacts
+    && positionFacts.aboveVwap === false
+    && positionFacts.supportBroken !== true
+    && positionFacts.consecutiveWeakBarsWithRisingVolume !== true
+    && positionFacts.hotspotRetreated !== true
+  );
+  if (firstBarVwapOnlySell) {
+    action = "hold";
+    hardBlock = "first_bar_vwap_only_sell";
+  }
+  const reasons = Array.isArray(body.reasons) ? body.reasons.map(String).slice(0, 8) : [];
+  if (firstBarVwapOnlySell) reasons.unshift("首根5分钟K线仅跌破VWAP，等待下一根K线确认");
   const decision: IntradayDecision = {
     id: String(body.id || `decision-${date}-${shanghaiTime().replace(":", "")}-${Math.random().toString(16).slice(2)}`),
     date, generatedAt: String(body.generatedAt || nowIso()), dataCutoff: String(body.dataCutoff || nowIso()), action, code,
@@ -356,10 +391,11 @@ export function recordNakedKLiveDecision(body: Record<string, unknown>) {
     referencePrice: Number.isFinite(Number(body.referencePrice)) ? Number(body.referencePrice) : null,
     confidence: Number.isFinite(Number(body.confidence)) ? Number(body.confidence) : null,
     evidenceCount: Number.isFinite(Number(body.evidenceCount)) ? Number(body.evidenceCount) : null,
-    reasons: Array.isArray(body.reasons) ? body.reasons.map(String).slice(0, 8) : [],
+    reasons: reasons.slice(0, 8),
     risks: Array.isArray(body.risks) ? body.risks.map(String).slice(0, 8) : [],
-    hardBlock: body.hardBlock ? String(body.hardBlock) : null,
+    hardBlock,
     status: action === "buy" || action === "sell" ? "pending" : "informational",
+    context: positionFacts ? { visibleBarCount, positionFacts } : undefined,
   };
   day.timeline.push(decision);
   writeDay(day);
@@ -432,7 +468,7 @@ function render(){const s=state,d=s.day.timeline.at(-1),pending=s.pending,open=s
 q('#openStatus').innerHTML=open?row('开盘广度',open.openBreadth==null?'—':pct(open.openBreadth))+row('37%门槛',open.entryAllowed?'<span class="pill">允许入场</span>':'<span class="pill bad">禁止开仓</span>')+row('数据截止',esc(open.dataCutoff)):'<div class="empty">等待09:25任务</div>';q('#top3').innerHTML=open?.top3?.length?open.top3.map((x,i)=>'<div class="candidate"><small>TOP '+(i+1)+' · '+esc(x.industry||'—')+'</small><b>'+esc(x.name)+'</b><span>'+esc(x.code)+'</span></div>').join(''):'<div class="empty">暂无观察股</div>';
 q('#position').innerHTML=p?row('股票',esc(p.name)+' '+esc(p.code))+row('状态',p.canSell?'<span class="pill">T+1可卖</span>':'<span class="pill warn">T+0锁定</span>')+row('股数',p.shares+'股')+row('成本价',Number(p.cost).toFixed(3))+row('最新价',Number(p.markPrice).toFixed(3))+row('浮动盈亏','<span class="'+(p.unrealizedPnl>=0?'positive':'negative')+'">'+money(p.unrealizedPnl)+'</span>'):'<div class="empty">当前空仓 · '+esc(s.state)+'</div>';q('#account').innerHTML=row('初始资金',money(a.initialCapital))+row('可用现金',money(a.cash))+row('持仓市值',money(a.marketValue))+row('总资产',money(a.totalAssets))+row('累计收益','<span class="'+(a.totalReturn>=0?'positive':'negative')+'">'+pct(a.totalReturn)+'</span>')+row('已实现盈亏',money(a.realizedPnl))+row('手续费',money(a.totalFees));
 q('#timeline').innerHTML=s.day.timeline.length?'<table><thead><tr><th>时间</th><th>动作</th><th>股票</th><th>置信度</th><th>证据</th><th>状态</th></tr></thead><tbody>'+[...s.day.timeline].reverse().map(x=>'<tr><td>'+esc(new Date(x.generatedAt).toLocaleTimeString('zh-CN',{hour:'2-digit',minute:'2-digit'}))+'</td><td>'+actionLabel(x.action)+'</td><td>'+esc(x.name||x.code||'—')+'</td><td>'+(x.confidence==null?'—':pct(x.confidence))+'</td><td>'+(x.evidenceCount??'—')+'</td><td>'+esc(x.status)+'</td></tr>').join('')+'</tbody></table>':'<div class="empty">今日尚无决策</div>';q('#fills').innerHTML=a.fills.length?'<table><thead><tr><th>时间</th><th>方向</th><th>股票</th><th>价格</th><th>股数</th><th>费用</th></tr></thead><tbody>'+a.fills.slice(0,20).map(x=>'<tr><td>'+esc(new Date(x.createdAt).toLocaleString('zh-CN'))+'</td><td>'+(x.side==='buy'?'买入':'卖出')+'</td><td>'+esc(x.name)+' '+esc(x.code)+'</td><td>'+x.price.toFixed(3)+'</td><td>'+x.shares+'</td><td>'+money(x.fee)+'</td></tr>').join('')+'</tbody></table>':'<div class="empty">尚无成交</div>';
-const sys=s.system;q('#system').innerHTML=row('服务','<span class="pill">在线</span>')+row('状态机',esc(s.state))+row('自动运行',esc(sys.scheduler.status||sys.scheduler.message||'未接入'))+row('行情',esc(sys.marketData.status||'unknown'))+row('DeepSeek',esc(sys.llm.status||'unknown'));q('#logs').innerHTML=sys.logs.length?sys.logs.map(x=>'<div class="log-line '+esc(x.level)+'">'+esc(x.timestamp)+' ['+esc(x.level)+'] '+esc(x.event)+' · '+esc(x.message)+'</div>').join(''):'<div class="empty">暂无日志</div>';alertDecision(d)}
+const sys=s.system;q('#system').innerHTML=row('服务','<span class="pill">在线</span>')+row('状态机',esc(s.state))+row('自动运行',esc(sys.scheduler.status||sys.scheduler.message||'未接入'))+row('行情',esc(sys.marketData.status||'unknown'))+row('DeepSeek',esc(sys.llm.status||'unknown'));const logMessage=x=>{if(x.event!=='open_decision'||String(x.message).includes('开盘广度')||!x.context)return x.message;const b=Number(x.context.breadth),t=Number(s.config.openBreadthThreshold);if(!Number.isFinite(b))return x.message;const gap=Math.abs(b-t);const reasons=open?.reasons?.length?'｜原因：'+open.reasons.join('；'):'';return x.message+'｜开盘广度'+pct(b)+'，门槛'+pct(t)+'，'+(b>=t?'高于':'低于')+pct(gap)+'｜候选'+((x.context.top3||[]).length)+'只'+reasons};q('#logs').innerHTML=sys.logs.length?sys.logs.map(x=>'<div class="log-line '+esc(x.level)+'">'+esc(x.timestamp)+' ['+esc(x.level)+'] '+esc(x.event)+' · '+esc(logMessage(x))+'</div>').join(''):'<div class="empty">暂无日志</div>';alertDecision(d)}
 async function api(path,options){const r=await fetch(path,options),d=await r.json();if(!r.ok)throw Error(d.error||'请求失败');return d}async function refresh(){state=await api('/api/naked-k-live/status');render()}async function ignorePending(){await api('/api/naked-k-live/decisions/'+encodeURIComponent(state.pending.id)+'/ignore',{method:'POST'});await refresh()}q('#fillForm').onsubmit=async e=>{e.preventDefault();const b=q('#saveFill');b.disabled=true;const requestId=crypto.randomUUID();try{const d=await api('/api/naked-k-live/fills',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({requestId,side:q('#side').value,code:q('#code').value,price:Number(q('#price').value),shares:Number(q('#shares').value)})});q('#message').textContent=d.warning||d.fill.name+'成交已保存';q('#fillForm').reset();await refresh()}catch(err){q('#message').textContent=err.message}finally{b.disabled=false}};q('#modalClose').onclick=()=>q('#modal').classList.remove('show');if('Notification'in window&&Notification.permission==='default')Notification.requestPermission();refresh().catch(e=>q('#action').textContent=e.message);setInterval(()=>refresh().catch(()=>{}),15000);
 </script></body></html>`;
 }

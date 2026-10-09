@@ -64,9 +64,57 @@ test("creates a 50k account and enforces the frozen single-position workflow", (
 test("blocks buy decisions when the 09:25 breadth gate is closed", () => {
   rmSync(stateDir, { recursive: true, force: true });
   mkdirSync(stateDir, { recursive: true });
-  live.recordNakedKLiveOpen({ openBreadth: 0.36, top3: [] });
-  assert.equal(live.loadNakedKLiveStatus().state, "ENTRY_BLOCKED");
+  live.recordNakedKLiveOpen({
+    openBreadth: 0.36, top3: [],
+    reasons: ["09:25开盘广度36.00%低于37%门槛"],
+    risks: ["今日禁止新开仓"],
+  });
+  const blocked = live.loadNakedKLiveStatus();
+  assert.equal(blocked.state, "ENTRY_BLOCKED");
+  assert.match(blocked.system.logs[0].message, /今日禁止新开仓/);
+  assert.match(blocked.system.logs[0].message, /开盘广度36\.00%/);
+  assert.match(blocked.system.logs[0].message, /低于门槛1\.00个百分点/);
+  assert.match(blocked.system.logs[0].message, /原因：09:25开盘广度36\.00%低于37%门槛/);
+  assert.equal(blocked.system.logs[0].context.threshold, 0.37);
+  assert.deepEqual(blocked.system.logs[0].context.risks, ["今日禁止新开仓"]);
   assert.throws(() => live.recordNakedKLiveDecision({
     id: "blocked-buy", action: "buy", code: "600111", referencePrice: 10,
   }), /没有开仓权限/);
+});
+
+test("blocks a first-bar sell when below VWAP is the only negative fact", () => {
+  rmSync(stateDir, { recursive: true, force: true });
+  mkdirSync(stateDir, { recursive: true });
+  const result = live.recordNakedKLiveDecision({
+    id: "first-bar-vwap-only", action: "sell", code: "002371", name: "北方华创",
+    referencePrice: 644.19, visibleBarCount: 1,
+    positionFacts: {
+      aboveVwap: false,
+      supportBroken: false,
+      consecutiveWeakBarsWithRisingVolume: false,
+      hotspotRetreated: false,
+    },
+  });
+  assert.equal(result.decision.action, "hold");
+  assert.equal(result.decision.status, "informational");
+  assert.equal(result.decision.hardBlock, "first_bar_vwap_only_sell");
+  assert.match(result.decision.reasons[0], /等待下一根K线确认/);
+});
+
+test("allows a first-bar sell when support is broken", () => {
+  rmSync(stateDir, { recursive: true, force: true });
+  mkdirSync(stateDir, { recursive: true });
+  const result = live.recordNakedKLiveDecision({
+    id: "first-bar-support-broken", action: "sell", code: "002371", name: "北方华创",
+    referencePrice: 619, visibleBarCount: 1,
+    positionFacts: {
+      aboveVwap: false,
+      supportBroken: true,
+      consecutiveWeakBarsWithRisingVolume: false,
+      hotspotRetreated: false,
+    },
+  });
+  assert.equal(result.decision.action, "sell");
+  assert.equal(result.decision.status, "pending");
+  assert.equal(result.decision.hardBlock, null);
 });
